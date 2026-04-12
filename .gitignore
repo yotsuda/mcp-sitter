@@ -1,0 +1,22 @@
+## .NET build output
+bin/
+obj/
+*.user
+*.suo
+*.userprefs
+.vs/
+.vscode/
+
+## JetBrains Rider
+.idea/
+*.sln.iml
+
+## OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+## Test artifacts
+test/FakeMcp/bin/
+test/FakeMcp/obj/
+test/FakeMcp/bin/Debug/net9.0/toolset.txt
