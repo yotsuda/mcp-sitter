@@ -112,6 +112,7 @@ public static class Program
         {
             Tool("fake_echo", "Echo text", "text"),
             Tool("fake_upper", "Uppercase text", "text"),
+            Tool("fake_log", "Write text to stderr and return confirmation", "text"),
         };
     }
 
@@ -136,13 +137,22 @@ public static class Program
         var name = request["params"]?["name"]?.GetValue<string>() ?? "";
         var argsNode = request["params"]?["arguments"] as JsonObject;
         var text = argsNode?["text"]?.GetValue<string>() ?? "";
-        string result = name switch
+        string result;
+        if (name == "fake_log")
         {
-            "fake_echo" => $"echo: {text}",
-            "fake_upper" => text.ToUpperInvariant(),
-            "fake_reverse" => new string(text.Reverse().ToArray()),
-            _ => $"unknown tool: {name}",
-        };
+            Console.Error.WriteLine(text);
+            result = $"logged: {text}";
+        }
+        else
+        {
+            result = name switch
+            {
+                "fake_echo" => $"echo: {text}",
+                "fake_upper" => text.ToUpperInvariant(),
+                "fake_reverse" => new string(text.Reverse().ToArray()),
+                _ => $"unknown tool: {name}",
+            };
+        }
         return new JsonObject
         {
             ["jsonrpc"] = "2.0",

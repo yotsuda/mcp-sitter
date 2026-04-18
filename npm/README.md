@@ -61,60 +61,13 @@ Unlike simple `stdin: inherit` passthrough wrappers:
 
 ## Architecture
 
-```mermaid
-graph LR
-    Client["MCP Client<br/>(Claude Code, Cursor, ...)"]
-    Sitter["mcp-sitter<br/>(bridge / proxy)"]
-    Child["Your MCP Server<br/>(child process)"]
-    Bin["your-server.exe<br/>(binary on disk)"]
-
-    Client <-->|"stdio JSON-RPC"| Sitter
-    Sitter <-->|"stdio JSON-RPC<br/>(spawned &amp; owned)"| Child
-    Sitter -.->|"sitter_kill to<br/>unlock for rebuild"| Bin
-    Bin -.->|"loaded on<br/>next spawn"| Child
-
-    style Sitter fill:#4a9,stroke:#272,color:#fff
-    style Client fill:#69c,stroke:#247,color:#fff
-    style Child fill:#c66,stroke:#733,color:#fff
-    style Bin fill:#eee,stroke:#999,color:#333
+```
+MCP Client <--stdio--> mcp-sitter <--stdio--> your MCP server
+  (spawned and owned by the bridge; lazily respawned after kill)
 ```
 
-### Lazy respawn sequence
-
-```mermaid
-sequenceDiagram
-    participant C as MCP Client
-    participant S as mcp-sitter
-    participant X as Child (old)
-    participant N as Child (new)
-
-    Note over C,X: Normal operation
-
-    C->>S: tools/call sitter_kill
-    S->>X: close stdin + SIGKILL (+same-path procs)
-    X--xS: exits
-    S-->>C: kill report
-
-    Note over C,S: You run dotnet build / cargo build / etc.
-
-    C->>S: tools/call my_tool
-    Note over S: child is down → lazy respawn
-    S->>N: spawn
-    S->>N: initialize (replayed, internal id)
-    N-->>S: initialize response (absorbed)
-    S->>N: notifications/initialized (replayed)
-    S->>N: tools/list (internal id)
-    N-->>S: tools/list response (absorbed + diffed)
-
-    alt tool set changed
-        S->>C: notifications/tools/list_changed
-    end
-
-    S->>N: tools/call my_tool (forwarded)
-    N-->>S: result
-    Note over S: prepend [mcp-sitter] notice to content[0]
-    S-->>C: result + restart notice<br/>(spawn #, startup, version, diff)
-```
+See the [GitHub README](https://github.com/yotsuda/mcp-sitter#architecture)
+for rendered architecture and sequence diagrams.
 
 ### Typical dev cycle
 
@@ -170,34 +123,13 @@ When a child crashes on startup or mid-session, `mcp-sitter` turns the usual
 `sitter_child_stderr`. Combined with `sitter_status`, this lets the AI
 diagnose and fix its own server without the developer even noticing:
 
-```mermaid
-sequenceDiagram
-    participant AI as AI (LLM)
-    participant C as MCP Client
-    participant S as mcp-sitter
-    participant X as Child MCP Server
-
-    AI->>C: tools/call my_tool
-    C->>S: tools/call my_tool
-    S->>X: forward
-    X--xS: exits (unhandled exception)
-
-    Note over S: next tool/call triggers lazy respawn
-    AI->>C: tools/call my_tool (retry)
-    C->>S: tools/call my_tool
-    S->>S: respawn + handshake replay
-    S-->>C: [mcp-sitter] restarted, previous: ⚠ crashed (exit -1)
-    C-->>AI: notice surfaces in content[0]
-
-    Note over AI: I see the crash. Let me look at stderr.
-    AI->>C: tools/call sitter_child_stderr (since_spawn=false)
-    C->>S: ...
-    Note over S: Read ring buffer, insert<br/>"--- child respawn (gen N, pid P) ---"<br/>between generations
-    S-->>C: pre-crash stack trace + new child's startup
-    C-->>AI: full stderr context
-
-    Note over AI: I see the NullReferenceException in<br/>MyServer.Startup.LoadConfig().<br/>Let me fix the config handling and rebuild.
 ```
+MCP Client <--stdio--> mcp-sitter <--stdio--> your MCP server
+  (spawned and owned by the bridge; lazily respawned after kill)
+```
+
+See the [GitHub README](https://github.com/yotsuda/mcp-sitter#architecture)
+for rendered architecture and sequence diagrams.
 
 Because the stderr ring survives respawns and the delimiter clearly marks
 the boundary, the AI sees *both* the crashed generation's stack trace *and*

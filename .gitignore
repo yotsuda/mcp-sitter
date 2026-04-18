@@ -20,3 +20,10 @@ desktop.ini
 test/FakeMcp/bin/
 test/FakeMcp/obj/
 test/FakeMcp/bin/Debug/net9.0/toolset.txt
+
+## Session scratch / handoff notes
+scratch/
+
+## Root AOT publish output (Build.ps1 mirrors the signed exe into npm/dist/
+## which IS tracked, so CI has the release artifact without re-signing)
+/dist/

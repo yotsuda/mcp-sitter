@@ -61,8 +61,15 @@ respawned on the next tool call. If the tool set changed, the parent
 is notified via notifications/tools/list_changed.
 
 Built-in tools exposed to the parent:
-  sitter_status  Show child status, watched binary, kill/spawn counts
-  sitter_kill    Kill the child and all processes running the same exe
-                 so the binary can be rebuilt");
+  sitter_status        Show child status, watched binary, spawn counts,
+                       last startup time, and previous exit info
+  sitter_kill          Kill the child and all processes running the same exe
+                       so the binary can be rebuilt
+  sitter_binary_info   Show version, build date, and metadata of the child
+                       binary — useful for detecting stale builds
+
+After a restart, the first tool/call response is annotated with a
+[mcp-sitter] notice describing the new spawn (startup time, binary
+version/age, previous exit, and tools-list diff).");
     }
 }

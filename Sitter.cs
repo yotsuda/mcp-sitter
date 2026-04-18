@@ -34,6 +34,14 @@ public sealed class Sitter
     volatile bool _childReady;
     volatile bool _childAlive;
     int _childGeneration;
+    int _expectedKill;
+
+    // child stderr ring buffer (single writer = ChildErrorLoop, no lock needed
+    // thanks to atomic ref writes; class entries avoid struct tearing on reader)
+    const int StderrBufferSize = 1000;
+    readonly StderrEntry?[] _stderrBuf = new StderrEntry?[StderrBufferSize];
+    int _stderrHead;
+    int _stderrCount;
 
     // internal request routing
     long _nextInternalIdCounter;
@@ -48,6 +56,14 @@ public sealed class Sitter
     FileSystemWatcher? _watcher;
     CancellationTokenSource? _debounceCts;
     readonly object _debounceLock = new();
+
+    // restart notice tracking
+    DateTime? _spawnStartedUtc;
+    TimeSpan? _lastStartupDuration;
+    int? _previousExitCode;
+    TimeSpan? _previousLifetime;
+    volatile bool _announceRestart;
+    string? _lastToolsDiffSummary;
 
     CancellationTokenSource? _shutdownCts;
 
@@ -211,7 +227,7 @@ public sealed class Sitter
         if (method == "tools/call" && hasId)
         {
             var name = obj["params"]?["name"]?.GetValue<string>();
-            if (name is SitterTools.Status or SitterTools.Kill)
+            if (name is SitterTools.Status or SitterTools.Kill or SitterTools.BinaryInfo or SitterTools.ChildStderr)
             {
                 await HandleSitterToolCallAsync(obj, name, ct);
                 return;
@@ -249,9 +265,9 @@ public sealed class Sitter
         var merged = new JsonArray();
         if (_childTools != null)
             foreach (var t in _childTools)
-                if (t != null) merged.Add(t.DeepClone());
+                if (t != null) merged.Add((JsonNode?)t.DeepClone());
         foreach (var t in SitterTools.Definitions())
-            if (t != null) merged.Add(t.DeepClone());
+            if (t != null) merged.Add((JsonNode?)t.DeepClone());
 
         var response = new JsonObject
         {
@@ -274,6 +290,8 @@ public sealed class Sitter
             {
                 SitterTools.Status => BuildStatusResult(),
                 SitterTools.Kill => await HandleKillCallAsync(ct),
+                SitterTools.BinaryInfo => BuildBinaryInfoResult(),
+                SitterTools.ChildStderr => BuildChildStderrResult(request),
                 _ => new JsonObject
                 {
                     ["content"] = new JsonArray(TextContent("unknown sitter tool")),
@@ -297,7 +315,7 @@ public sealed class Sitter
     JsonObject BuildStatusResult()
     {
         var argsArr = new JsonArray();
-        foreach (var a in _config.ChildArgs) argsArr.Add(JsonValue.Create(a));
+        foreach (var a in _config.ChildArgs) argsArr.Add((JsonNode?)JsonValue.Create(a));
 
         var payload = new JsonObject
         {
@@ -305,15 +323,29 @@ public sealed class Sitter
             ["childArgs"] = argsArr,
             ["watchPath"] = _config.WatchPath,
             ["workingDirectory"] = _config.WorkingDirectory,
+            ["binaryPath"] = ResolveChildExePath(),
+            ["binaryVersion"] = GetBinaryVersion(ResolveChildExePath()),
             ["childState"] = _childState,
             ["childAlive"] = _childAlive,
             ["childReady"] = _childReady,
+            ["childPid"] = _child?.Id,
             ["childToolCount"] = _childTools?.Count ?? 0,
             ["spawnCount"] = _spawnCount,
             ["killCount"] = _killCount,
             ["lastKillUtc"] = _lastKillUtc == default ? null : _lastKillUtc.ToString("O"),
             ["lastKillReason"] = _lastKillReason,
-            ["uptimeSeconds"] = (int)(DateTime.UtcNow - _startedUtc).TotalSeconds,
+            ["lastStartupMs"] = _lastStartupDuration.HasValue
+                ? (int)_lastStartupDuration.Value.TotalMilliseconds
+                : null,
+            ["childUptimeSeconds"] = _childAlive && _spawnStartedUtc.HasValue
+                ? (int)(DateTime.UtcNow - _spawnStartedUtc.Value).TotalSeconds
+                : null,
+            ["previousExitCode"] = _previousExitCode,
+            ["previousLifetimeSeconds"] = _previousLifetime.HasValue
+                ? (int)_previousLifetime.Value.TotalSeconds
+                : null,
+            ["lastToolsDiff"] = _lastToolsDiffSummary,
+            ["sitterUptimeSeconds"] = (int)(DateTime.UtcNow - _startedUtc).TotalSeconds,
         };
         var text = payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
         return new JsonObject { ["content"] = new JsonArray(TextContent(text)) };
@@ -327,7 +359,7 @@ public sealed class Sitter
         var childPid = _child?.Id;
         await KillChildAsync();
         if (childPid.HasValue)
-            killed.Add(new JsonObject { ["pid"] = childPid.Value, ["relation"] = "child" });
+            killed.Add((JsonNode?)new JsonObject { ["pid"] = childPid.Value, ["relation"] = "child" });
 
         // 2. Kill all other processes running the same exe
         var exePath = ResolveChildExePath();
@@ -344,7 +376,7 @@ public sealed class Sitter
                         string.Equals(Path.GetFullPath(modulePath), exePath, StringComparison.OrdinalIgnoreCase))
                     {
                         proc.Kill(entireProcessTree: true);
-                        killed.Add(new JsonObject { ["pid"] = proc.Id, ["relation"] = "same-path" });
+                        killed.Add((JsonNode?)new JsonObject { ["pid"] = proc.Id, ["relation"] = "same-path" });
                         Log.Info($"killed same-path process pid {proc.Id}");
                     }
                 }
@@ -364,6 +396,20 @@ public sealed class Sitter
         };
         var text = report.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
         return new JsonObject { ["content"] = new JsonArray(TextContent(text)) };
+    }
+
+    static string? GetBinaryVersion(string? exe)
+    {
+        if (exe == null || !File.Exists(exe)) return null;
+        try
+        {
+            var ver = FileVersionInfo.GetVersionInfo(exe);
+            var verStr = !string.IsNullOrWhiteSpace(ver.ProductVersion)
+                ? ver.ProductVersion!.Trim()
+                : ver.FileVersion?.Trim();
+            return string.IsNullOrWhiteSpace(verStr) ? null : verStr;
+        }
+        catch { return null; }
     }
 
     string? ResolveChildExePath()
@@ -462,6 +508,9 @@ public sealed class Sitter
         _childAlive = true;
         _childReady = false;
         _childState = "running";
+        _spawnStartedUtc = DateTime.UtcNow;
+        Interlocked.Exchange(ref _expectedKill, 0);
+        if (_spawnCount > 0) _announceRestart = true;
         _spawnCount++;
         var gen = Interlocked.Increment(ref _childGeneration);
         Log.Info($"child spawned; pid {child.Id} gen {gen} (total spawns: {_spawnCount})");
@@ -479,6 +528,21 @@ public sealed class Sitter
         Log.Info($"child (gen {gen}) exited; code {code}");
         if (Volatile.Read(ref _childGeneration) == gen)
         {
+            _previousExitCode = int.TryParse(code, out var ec) ? ec : null;
+            _previousLifetime = _spawnStartedUtc.HasValue
+                ? DateTime.UtcNow - _spawnStartedUtc.Value
+                : null;
+
+            var wasExpected = Interlocked.Exchange(ref _expectedKill, 0) != 0;
+            if (!wasExpected)
+            {
+                _killCount++;
+                _lastKillUtc = DateTime.UtcNow;
+                _lastKillReason = ec == 0
+                    ? "external (exit 0)"
+                    : $"external/crash (exit {code})";
+            }
+
             _childAlive = false;
             _childReady = false;
             _childState = $"exited ({code})";
@@ -506,6 +570,7 @@ public sealed class Sitter
             _childAlive = false;
             _childReady = false;
             _childState = "killing";
+            Interlocked.Exchange(ref _expectedKill, 1);
             try
             {
                 if (!child.HasExited)
@@ -565,6 +630,8 @@ public sealed class Sitter
 
         _childReady = true;
         _childState = "ready";
+        if (_spawnStartedUtc.HasValue)
+            _lastStartupDuration = DateTime.UtcNow - _spawnStartedUtc.Value;
 
         if (_cachedInitializedLine != null)
             await SendToChildAsync(_cachedInitializedLine);
@@ -599,11 +666,13 @@ public sealed class Sitter
 
         if (resp?["result"]?["tools"] is not JsonArray tools) return;
 
-        var before = _childTools?.ToJsonString();
+        var oldTools = _childTools;
         _childTools = tools.DeepClone().AsArray();
-        var after = _childTools?.ToJsonString();
 
-        if (before != after)
+        var diff = ComputeToolsDiff(oldTools, _childTools);
+        _lastToolsDiffSummary = FormatToolsDiff(diff);
+
+        if (_lastToolsDiffSummary != null)
         {
             var notification = new JsonObject
             {
@@ -611,7 +680,7 @@ public sealed class Sitter
                 ["method"] = "notifications/tools/list_changed",
             };
             await SendToClientAsync(notification);
-            Log.Info("tools list changed; notified client");
+            Log.Info($"tools list changed; notified client ({_lastToolsDiffSummary})");
         }
     }
 
@@ -623,11 +692,23 @@ public sealed class Sitter
 
     async Task ChildErrorLoop(Process child, int gen)
     {
+        // Snapshot pid now — child.Id throws after the process exits, but we
+        // may still be draining buffered stderr lines at that point.
+        int pid;
+        try { pid = child.Id; } catch { pid = -1; }
         try
         {
             string? line;
             while ((line = await child.StandardError.ReadLineAsync()) != null)
+            {
+                // Push to ring buffer for sitter_child_stderr. Single writer path
+                // (this task per generation) + atomic ref write => no lock needed.
+                _stderrBuf[_stderrHead] = new StderrEntry(line, gen, pid, DateTime.UtcNow);
+                _stderrHead = (_stderrHead + 1) % _stderrBuf.Length;
+                if (_stderrCount < _stderrBuf.Length) _stderrCount++;
+
                 Log.Info($"[child:{gen}] {line}");
+            }
         }
         catch { }
     }
@@ -677,6 +758,8 @@ public sealed class Sitter
             {
                 _childReady = true;
                 _childState = "ready";
+                if (_spawnStartedUtc.HasValue)
+                    _lastStartupDuration = DateTime.UtcNow - _spawnStartedUtc.Value;
                 Log.Info("child initialized (client-driven)");
             }
 
@@ -687,10 +770,31 @@ public sealed class Sitter
                 _childTools = rawTools.DeepClone().AsArray();
                 var mergedArr = rawTools.DeepClone().AsArray();
                 foreach (var t in SitterTools.Definitions())
-                    if (t != null) mergedArr.Add(t.DeepClone());
+                    if (t != null) mergedArr.Add((JsonNode?)t.DeepClone());
                 obj["result"]!["tools"] = mergedArr;
                 await SendToClientAsync(obj);
                 return;
+            }
+
+            // Inject restart notice on the first tool/call response after a respawn.
+            // Tool/call responses have result.content (a JsonArray); initialize /
+            // tools/list / other response shapes do not, so they are skipped.
+            if (_announceRestart
+                && obj["result"] is JsonObject resObj
+                && resObj["content"] is JsonArray contentArr)
+            {
+                _announceRestart = false;
+                var notice = BuildRestartNotice();
+                if (notice != null)
+                {
+                    contentArr.Insert(0, (JsonNode?)new JsonObject
+                    {
+                        ["type"] = "text",
+                        ["text"] = notice,
+                    });
+                    await SendToClientAsync(obj);
+                    return;
+                }
             }
         }
 
@@ -747,4 +851,237 @@ public sealed class Sitter
             }, token);
         }
     }
+
+    // =================================================================
+    // restart notice + binary info
+    // =================================================================
+
+    string? BuildRestartNotice()
+    {
+        var parts = new List<string>();
+
+        var header = $"server restarted (spawn #{_spawnCount}";
+        if (_child?.Id is int pid) header += $", pid {pid}";
+        if (_lastStartupDuration is TimeSpan startup)
+            header += $", startup {startup.TotalSeconds:0.0}s";
+        header += ")";
+        parts.Add(header);
+
+        var exe = ResolveChildExePath();
+        if (exe != null) parts.Add($"path: {exe}");
+        if (exe != null && File.Exists(exe))
+        {
+            try
+            {
+                var fi = new FileInfo(exe);
+                var age = HumanizeAge(DateTime.UtcNow - fi.LastWriteTimeUtc);
+                string binaryPart;
+                try
+                {
+                    var ver = FileVersionInfo.GetVersionInfo(exe);
+                    var verStr = !string.IsNullOrWhiteSpace(ver.ProductVersion)
+                        ? ver.ProductVersion!.Trim()
+                        : ver.FileVersion?.Trim();
+                    binaryPart = !string.IsNullOrWhiteSpace(verStr)
+                        ? $"binary v{verStr} built {age}"
+                        : $"binary built {age}";
+                }
+                catch
+                {
+                    binaryPart = $"binary built {age}";
+                }
+                parts.Add(binaryPart);
+            }
+            catch { }
+        }
+
+        if (_previousExitCode.HasValue || _previousLifetime.HasValue)
+        {
+            var prev = "previous: ";
+            if (_previousExitCode.HasValue)
+            {
+                var code = _previousExitCode.Value;
+                prev += code == 0 ? "exit 0" : $"\u26A0 crashed (exit {code})";
+            }
+            else prev += "unknown exit";
+            if (_previousLifetime.HasValue)
+                prev += $" after {FormatShortDuration(_previousLifetime.Value)}";
+            parts.Add(prev);
+        }
+
+        if (_lastToolsDiffSummary != null)
+            parts.Add($"tools: {_lastToolsDiffSummary}");
+
+        return "[mcp-sitter] " + string.Join(". ", parts) + ".";
+    }
+
+    JsonObject BuildChildStderrResult(JsonObject request)
+    {
+        var args = request["params"]?["arguments"] as JsonObject;
+        var lines = args?["lines"]?.GetValue<int>() ?? 200;
+        lines = Math.Clamp(lines, 1, _stderrBuf.Length);
+        var sinceSpawn = args?["since_spawn"]?.GetValue<bool>() ?? false;
+        int? onlyGen = sinceSpawn ? Volatile.Read(ref _childGeneration) : null;
+
+        // Snapshot the ring. The reader may observe _stderrHead / _stderrCount
+        // in a slightly inconsistent state relative to each other; the worst
+        // case is that one or two entries at the boundary are missed or
+        // duplicated — acceptable for a diagnostics tool.
+        var head = _stderrHead;
+        var count = _stderrCount;
+        var capacity = _stderrBuf.Length;
+        var start = (head - count + capacity) % capacity;
+
+        var collected = new List<StderrEntry>(count);
+        for (int i = 0; i < count; i++)
+        {
+            var e = _stderrBuf[(start + i) % capacity];
+            if (e == null) continue;
+            if (onlyGen.HasValue && e.Gen != onlyGen.Value) continue;
+            collected.Add(e);
+        }
+        var offset = Math.Max(0, collected.Count - lines);
+        var tail = collected.GetRange(offset, collected.Count - offset);
+
+        string text;
+        if (tail.Count == 0)
+        {
+            text = "(no child stderr in buffer)";
+        }
+        else
+        {
+            var sb = new StringBuilder();
+            int? prevGen = null;
+            foreach (var e in tail)
+            {
+                if (prevGen.HasValue && e.Gen != prevGen.Value)
+                {
+                    sb.Append("----- child respawn (gen ").Append(e.Gen)
+                      .Append(", pid ").Append(e.Pid).Append(") -----\n");
+                }
+                sb.Append(e.Line).Append('\n');
+                prevGen = e.Gen;
+            }
+            if (sb.Length > 0 && sb[^1] == '\n') sb.Length--;
+            text = sb.ToString();
+        }
+        return new JsonObject { ["content"] = new JsonArray(TextContent(text)) };
+    }
+
+    JsonObject BuildBinaryInfoResult()
+    {
+        var exe = ResolveChildExePath();
+        var payload = new JsonObject
+        {
+            ["path"] = exe,
+            ["exists"] = exe != null && File.Exists(exe),
+        };
+
+        if (exe != null && File.Exists(exe))
+        {
+            try
+            {
+                var fi = new FileInfo(exe);
+                payload["sizeBytes"] = fi.Length;
+                payload["mtime"] = fi.LastWriteTimeUtc.ToString("O");
+                payload["mtimeHuman"] = HumanizeAge(DateTime.UtcNow - fi.LastWriteTimeUtc);
+            }
+            catch (Exception ex)
+            {
+                payload["fileInfoError"] = ex.Message;
+            }
+
+            try
+            {
+                var ver = FileVersionInfo.GetVersionInfo(exe);
+                if (!string.IsNullOrWhiteSpace(ver.FileVersion))
+                    payload["fileVersion"] = ver.FileVersion;
+                if (!string.IsNullOrWhiteSpace(ver.ProductVersion))
+                    payload["productVersion"] = ver.ProductVersion;
+                if (!string.IsNullOrWhiteSpace(ver.ProductName))
+                    payload["productName"] = ver.ProductName;
+                if (!string.IsNullOrWhiteSpace(ver.FileDescription))
+                    payload["fileDescription"] = ver.FileDescription;
+                if (!string.IsNullOrWhiteSpace(ver.CompanyName))
+                    payload["companyName"] = ver.CompanyName;
+                if (!string.IsNullOrWhiteSpace(ver.LegalCopyright))
+                    payload["copyright"] = ver.LegalCopyright;
+                payload["isDebug"] = ver.IsDebug;
+            }
+            catch (Exception ex)
+            {
+                payload["versionInfoError"] = ex.Message;
+            }
+        }
+
+        var text = payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        return new JsonObject { ["content"] = new JsonArray(TextContent(text)) };
+    }
+
+    readonly record struct ToolsDiff(List<string> Added, List<string> Removed, List<string> Modified);
+
+    static ToolsDiff ComputeToolsDiff(JsonArray? before, JsonArray? after)
+    {
+        var beforeMap = ToolsByName(before);
+        var afterMap = ToolsByName(after);
+        var added = new List<string>();
+        var removed = new List<string>();
+        var modified = new List<string>();
+
+        foreach (var k in afterMap.Keys)
+            if (!beforeMap.ContainsKey(k)) added.Add(k);
+        foreach (var k in beforeMap.Keys)
+            if (!afterMap.ContainsKey(k)) removed.Add(k);
+        foreach (var k in beforeMap.Keys)
+            if (afterMap.TryGetValue(k, out var aft)
+                && beforeMap[k].ToJsonString() != aft.ToJsonString())
+                modified.Add(k);
+
+        added.Sort(StringComparer.Ordinal);
+        removed.Sort(StringComparer.Ordinal);
+        modified.Sort(StringComparer.Ordinal);
+        return new ToolsDiff(added, removed, modified);
+    }
+
+    static Dictionary<string, JsonObject> ToolsByName(JsonArray? arr)
+    {
+        var map = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
+        if (arr == null) return map;
+        foreach (var t in arr)
+            if (t is JsonObject obj && obj["name"]?.GetValue<string>() is string name)
+                map[name] = obj;
+        return map;
+    }
+
+    static string? FormatToolsDiff(ToolsDiff diff)
+    {
+        if (diff.Added.Count == 0 && diff.Removed.Count == 0 && diff.Modified.Count == 0)
+            return null;
+        var parts = new List<string>();
+        if (diff.Added.Count > 0)
+            parts.Add($"+{diff.Added.Count} added ({string.Join(", ", diff.Added)})");
+        if (diff.Removed.Count > 0)
+            parts.Add($"-{diff.Removed.Count} removed ({string.Join(", ", diff.Removed)})");
+        if (diff.Modified.Count > 0)
+            parts.Add($"{diff.Modified.Count} schema changed ({string.Join(", ", diff.Modified)})");
+        return string.Join(", ", parts);
+    }
+
+    static string HumanizeAge(TimeSpan age)
+    {
+        if (age.TotalSeconds < 1) return "just now";
+        if (age.TotalSeconds < 60) return $"{age.TotalSeconds:0}s ago";
+        if (age.TotalMinutes < 60) return $"{age.TotalMinutes:0} min ago";
+        if (age.TotalHours < 24) return $"{age.TotalHours:0.0} hours ago";
+        return $"{age.TotalDays:0.0} days ago";
+    }
+
+    static string FormatShortDuration(TimeSpan d)
+    {
+        if (d.TotalSeconds < 60) return $"{d.TotalSeconds:0.0}s";
+        if (d.TotalMinutes < 60) return $"{d.TotalMinutes:0}m";
+        return $"{d.TotalHours:0.0}h";
+    }
+
+    sealed record StderrEntry(string Line, int Gen, int Pid, DateTime Utc);
 }
