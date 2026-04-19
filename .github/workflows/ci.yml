@@ -47,55 +47,61 @@ jobs:
           $cfg.Output.Verbosity = 'Detailed'
           Invoke-Pester -Configuration $cfg
 
-  publish:
-    name: publish (${{ matrix.rid }})
+  publish-platform:
+    # Builds (or verifies, for Windows) the platform-specific AOT binary
+    # and publishes the matching `mcp-sitter-<platform>-<arch>` sub-package
+    # to npmjs.com with SLSA provenance via OIDC Trusted Publisher.
+    #
+    # Trusted Publisher must be configured for EACH of the 5 packages on
+    # npmjs.com (one-time setup per package, after each package's first
+    # manual publish):
+    #   https://www.npmjs.com/package/<pkg>/access
+    #     -> Trusted Publishers -> Add
+    #        Publisher: GitHub Actions
+    #        Org/User:  yotsuda
+    #        Repo:      mcp-sitter
+    #        Workflow:  .github/workflows/ci.yml
+    #
+    # Bootstrap (first publish of any new package):
+    #   1. Sign Win binary locally: .\Build.ps1 -Sign
+    #   2. Push the vX.Y.Z tag — CI will fail on the npm publish step
+    #      because TP is not yet configured.
+    #   3. Manually `npm publish` each new package once from your
+    #      workstation to seed the registry entry.
+    #   4. Configure TP for each package via the URL above.
+    #   5. Re-trigger the workflow (delete + re-push tag, or workflow_dispatch).
+    #      Subsequent vX.Y.(Z+1) publishes will be fully automatic.
+    #
+    # The Windows binary is committed (signed locally; PFX never touches
+    # CI). The other 3 binaries are built fresh on each runner.
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, rid: win-x64 }
-          - { os: ubuntu-latest,  rid: linux-x64 }
-          - { os: macos-13,       rid: osx-x64 }    # Intel runner
-          - { os: macos-latest,   rid: osx-arm64 }  # Apple Silicon runner
+          - os: windows-latest
+            dotnet_rid: win-x64
+            npm_dir: win32-x64
+            bin_name: mcp-sitter.exe
+            skip_build: true
+          - os: ubuntu-latest
+            dotnet_rid: linux-x64
+            npm_dir: linux-x64
+            bin_name: mcp-sitter
+            skip_build: false
+          - os: macos-13
+            dotnet_rid: osx-x64
+            npm_dir: darwin-x64
+            bin_name: mcp-sitter
+            skip_build: false
+          - os: macos-latest
+            dotnet_rid: osx-arm64
+            npm_dir: darwin-arm64
+            bin_name: mcp-sitter
+            skip_build: false
+    name: publish (${{ matrix.npm_dir }})
     runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '9.0.x'
-
-      - name: Publish (Release, NativeAOT, ${{ matrix.rid }})
-        run: dotnet publish -c Release -r ${{ matrix.rid }} -o out/${{ matrix.rid }} --nologo
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mcp-sitter-${{ matrix.rid }}
-          path: out/${{ matrix.rid }}/mcp-sitter*
-          if-no-files-found: error
-
-  publish-npm:
-    # Publishes mcp-sitter to npmjs.com with SLSA provenance via
-    # OIDC-based Trusted Publisher (no NPM_TOKEN anywhere).
-    #
-    # Prerequisites (one-time setup on npmjs.com, after initial manual publish):
-    #   Settings -> Trusted Publishers -> Add
-    #     Publisher: GitHub Actions
-    #     Org/User:  yotsuda
-    #     Repo:      mcp-sitter
-    #     Workflow:  .github/workflows/ci.yml
-    #     Env:       (leave blank; tag push gates the job via the `if:` below)
-    #
-    # The committed `npm/dist/mcp-sitter.exe` is what ships. Sign it locally
-    # via `.\Build.ps1 -Sign` (PFX password prompted on your machine, never
-    # touches CI), commit, then push the `vX.Y.Z` tag.
-    name: publish-npm (provenance)
-    needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
     permissions:
       id-token: write    # OIDC for Trusted Publisher + provenance
       contents: read
@@ -107,16 +113,70 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Verify signed binary is committed
-        working-directory: npm
-        run: |
-          if [ ! -f dist/mcp-sitter.exe ]; then
-            echo "::error::npm/dist/mcp-sitter.exe is missing. Run '.\\Build.ps1 -Sign' locally and commit before pushing the tag."
-            exit 1
-          fi
-          size=$(stat -c%s dist/mcp-sitter.exe)
-          echo "npm/dist/mcp-sitter.exe present ($size bytes)"
+      - uses: actions/setup-dotnet@v4
+        if: ${{ !matrix.skip_build }}
+        with:
+          dotnet-version: '9.0.x'
 
-      - name: npm publish (with provenance)
+      - name: Build AOT binary (${{ matrix.dotnet_rid }})
+        if: ${{ !matrix.skip_build }}
+        run: dotnet publish -c Release -r ${{ matrix.dotnet_rid }} -o out --nologo
+
+      - name: Place binary into platform package
+        if: ${{ !matrix.skip_build }}
+        shell: bash
+        run: |
+          mkdir -p "npm/platforms/${{ matrix.npm_dir }}/bin"
+          cp "out/${{ matrix.bin_name }}" "npm/platforms/${{ matrix.npm_dir }}/bin/"
+          chmod +x "npm/platforms/${{ matrix.npm_dir }}/bin/${{ matrix.bin_name }}"
+
+      - name: Verify Windows binary is committed and signed
+        if: ${{ matrix.skip_build }}
+        shell: pwsh
+        run: |
+          $binary = "npm/platforms/win32-x64/bin/mcp-sitter.exe"
+          if (-not (Test-Path $binary)) {
+            Write-Error "$binary is missing. Sign locally via .\Build.ps1 -Sign and commit before tagging."
+            exit 1
+          }
+          $sig = Get-AuthenticodeSignature $binary
+          if ($sig.Status -ne 'Valid') {
+            Write-Error "Authenticode signature is not Valid: $($sig.Status). $($sig.StatusMessage)"
+            exit 1
+          }
+          $size = (Get-Item $binary).Length
+          Write-Host "Windows binary present ($size bytes), signature Valid (CN=$($sig.SignerCertificate.Subject))."
+
+      - name: Upload AOT binary as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-sitter-${{ matrix.dotnet_rid }}
+          path: npm/platforms/${{ matrix.npm_dir }}/bin/${{ matrix.bin_name }}
+          if-no-files-found: error
+
+      - name: npm publish (${{ matrix.npm_dir }}, with provenance)
+        working-directory: npm/platforms/${{ matrix.npm_dir }}
+        run: npm publish --provenance
+
+  publish-umbrella:
+    # Publish the umbrella `mcp-sitter` package AFTER all 4 platform
+    # sub-packages succeed, so a user installing `mcp-sitter` always
+    # finds a matching optional dependency in the registry.
+    name: publish (umbrella)
+    needs: publish-platform
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: npm publish umbrella (with provenance)
         working-directory: npm
         run: npm publish --provenance
