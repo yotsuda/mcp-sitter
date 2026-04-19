@@ -11,8 +11,8 @@ obj/
 ## - npm/bin/         : the umbrella's cli.mjs wrapper, always tracked
 ## - npm/platforms/win32-x64/bin/ : signed Win exe is committed (PFX
 ##   never touches CI; sign locally via .\Build.ps1 -Sign).
-## Other platform bin dirs (linux/macOS) stay ignored — CI builds them
-## fresh per runner and publishes from the runner's working tree.
+## The Linux platform bin dir stays ignored — CI builds it fresh on
+## the runner and publishes from the runner's working tree.
 !npm/bin/
 !npm/bin/**
 !npm/platforms/win32-x64/bin/

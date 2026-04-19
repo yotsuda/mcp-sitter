@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +52,7 @@ jobs:
     # and publishes the matching `mcp-sitter-<platform>-<arch>` sub-package
     # to npmjs.com with SLSA provenance via OIDC Trusted Publisher.
     #
-    # Trusted Publisher must be configured for EACH of the 5 packages on
+    # Trusted Publisher must be configured for EACH of the 3 packages on
     # npmjs.com (one-time setup per package, after each package's first
     # manual publish):
     #   https://www.npmjs.com/package/<pkg>/access
@@ -73,7 +73,8 @@ jobs:
     #      Subsequent vX.Y.(Z+1) publishes will be fully automatic.
     #
     # The Windows binary is committed (signed locally; PFX never touches
-    # CI). The other 3 binaries are built fresh on each runner.
+    # CI). The Linux binary is built fresh on the runner.
+    # macOS support is deferred to a future version.
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
@@ -88,16 +89,6 @@ jobs:
           - os: ubuntu-latest
             dotnet_rid: linux-x64
             npm_dir: linux-x64
-            bin_name: mcp-sitter
-            skip_build: false
-          - os: macos-13
-            dotnet_rid: osx-x64
-            npm_dir: darwin-x64
-            bin_name: mcp-sitter
-            skip_build: false
-          - os: macos-latest
-            dotnet_rid: osx-arm64
-            npm_dir: darwin-arm64
             bin_name: mcp-sitter
             skip_build: false
     name: publish (${{ matrix.npm_dir }})
@@ -159,7 +150,7 @@ jobs:
         run: npm publish --provenance
 
   publish-umbrella:
-    # Publish the umbrella `mcp-sitter` package AFTER all 4 platform
+    # Publish the umbrella `mcp-sitter` package AFTER both platform
     # sub-packages succeed, so a user installing `mcp-sitter` always
     # finds a matching optional dependency in the registry.
     name: publish (umbrella)

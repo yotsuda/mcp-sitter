@@ -30,9 +30,7 @@
   ],
   "optionalDependencies": {
     "mcp-sitter-win32-x64": "0.2.0",
-    "mcp-sitter-linux-x64": "0.2.0",
-    "mcp-sitter-darwin-x64": "0.2.0",
-    "mcp-sitter-darwin-arm64": "0.2.0"
+    "mcp-sitter-linux-x64": "0.2.0"
   },
   "publishConfig": {
     "access": "public"

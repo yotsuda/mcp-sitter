@@ -16,7 +16,7 @@ try {
 } catch {
   console.error(
     `mcp-sitter: no native binary available for ${platform}-${arch}.\n` +
-      `Supported platforms: win32-x64, linux-x64, darwin-x64, darwin-arm64.\n` +
+      `Supported platforms: win32-x64, linux-x64.\n` +
       `If npm install reported optional dependency failures, that is the cause.\n` +
       `See https://github.com/yotsuda/mcp-sitter for source builds.`
   );

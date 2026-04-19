@@ -247,14 +247,14 @@ dotnet build test/FakeMcp/FakeMcp.csproj -c Debug
 Invoke-Pester test/McpSitter.Tests.ps1 -Output Detailed
 ```
 
-CI runs the same Pester suite on **Windows / Ubuntu / macOS** matrix via
+CI runs the same Pester suite on **Windows / Ubuntu** matrix via
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Tagged releases
 additionally run an AOT `dotnet publish` for each native RID
-(win-x64 / linux-x64 / osx-x64 / osx-arm64), upload the binaries as
-workflow artifacts, and publish them to npm as platform-specific
-sub-packages (`mcp-sitter-{win32,linux,darwin}-{x64,arm64}`) which the
-umbrella `mcp-sitter` package resolves at runtime via its
-`optionalDependencies`.
+(win-x64 / linux-x64), upload the binaries as workflow artifacts, and
+publish them to npm as platform-specific sub-packages
+(`mcp-sitter-win32-x64`, `mcp-sitter-linux-x64`) which the umbrella
+`mcp-sitter` package resolves at runtime via its `optionalDependencies`.
+macOS support is deferred to a future version.
 
 ## Built-in tools
 
@@ -285,8 +285,8 @@ cd mcp-sitter
 
 The AOT binary lands at `dist/mcp-sitter.exe` (and is mirrored to
 `npm/platforms/win32-x64/bin/mcp-sitter.exe` for the Windows npm
-sub-package). Linux/macOS sub-packages are built fresh on each runner
-in CI from the same `dotnet publish -c Release -r <rid>` command.
+sub-package). The Linux sub-package is built fresh on the runner in CI
+from the same `dotnet publish -c Release -r linux-x64` command.
 
 ## CLI
 
@@ -348,14 +348,11 @@ so the AI's tool roster stays stable.
   `resources/*` or `prompts/*` pass through transparently but the bridge
   does not issue a `notifications/resources/list_changed` after respawn on
   its own (yet).
-- **macOS binaries are not Apple-notarized.** The npm tarball ships an
-  unsigned native exe for `darwin-x64` / `darwin-arm64`, so on first
-  launch Gatekeeper may quarantine it. Clear the quarantine attribute
-  once with
-  `xattr -d com.apple.quarantine $(npm root -g)/mcp-sitter-darwin-*/bin/mcp-sitter`,
-  or right-click → "Open" once from Finder. (Linux binaries ship
-  unsigned too, which matches Linux convention.) The Windows binary is
-  Authenticode-signed by the project's code-signing cert.
+- **macOS is not yet supported.** v0.2.0 ships `win32-x64` and
+  `linux-x64` native binaries only; a `darwin-*` build is planned for a
+  future release. The Linux binary ships unsigned (Linux convention);
+  the Windows binary is Authenticode-signed by the project's
+  code-signing cert.
 - **One child per bridge instance.** The child command is fixed at bridge
   startup; to supervise multiple MCP servers, register multiple `mcp-sitter`
   instances with different names.
@@ -387,7 +384,7 @@ mcp-sitter/
     FakeMcp/                        minimal stdio MCP server for tests
   npm/
     package.json                    umbrella mcp-sitter; optionalDependencies
-                                    pin all 4 platform sub-packages
+                                    pin both platform sub-packages
     bin/cli.mjs                     resolves mcp-sitter-<platform>-<arch>
                                     at runtime via require.resolve
     platforms/
@@ -396,8 +393,6 @@ mcp-sitter/
         bin/mcp-sitter.exe          signed locally via Build.ps1 -Sign,
                                     committed (PFX never touches CI)
       linux-x64/    package.json    bin/ populated by CI per runner
-      darwin-x64/   package.json    bin/ populated by CI per runner
-      darwin-arm64/ package.json    bin/ populated by CI per runner
 ```
 
 The .NET namespace and types are `McpSitter` / `Sitter` (PascalCase, .NET

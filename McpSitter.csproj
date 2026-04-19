@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <PublishAot>true</PublishAot>
     <StripSymbols>true</StripSymbols>
     <Authors>Yoshifumi Tsuda</Authors>
