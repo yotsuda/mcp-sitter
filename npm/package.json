@@ -1,6 +1,6 @@
 {
   "name": "mcp-sitter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hot-reload bridge for stdio MCP servers. Rebuild your MCP server without restarting the MCP client. Injects restart notices and tools-list diffs into tool/call responses so the AI self-corrects after schema changes.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",
@@ -20,18 +20,20 @@
     "claude-code",
     "ai"
   ],
-  "os": [
-    "win32"
-  ],
   "bin": {
     "mcp-sitter": "bin/cli.mjs"
   },
   "files": [
     "bin/",
-    "dist/",
     "README.md",
     "LICENSE"
   ],
+  "optionalDependencies": {
+    "mcp-sitter-win32-x64": "0.2.0",
+    "mcp-sitter-linux-x64": "0.2.0",
+    "mcp-sitter-darwin-x64": "0.2.0",
+    "mcp-sitter-darwin-arm64": "0.2.0"
+  },
   "publishConfig": {
     "access": "public"
   }

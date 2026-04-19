@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    Release-publish mcp-sitter (NativeAOT) and deploy to npm/dist.
+    Release-publish mcp-sitter (NativeAOT) and deploy to npm/platforms/win32-x64/bin.
 .DESCRIPTION
     Stops any running mcp-sitter.exe, runs `dotnet publish -c Release` (NativeAOT
     single native exe into ./dist), optionally Authenticode-signs the binary,
-    and mirrors the resulting binary to ./npm/dist so the npm package ships
-    the fresh build.
+    and mirrors the resulting binary to ./npm/platforms/win32-x64/bin so the
+    Windows platform sub-package ships the fresh build.
 .PARAMETER Sign
     Authenticode-sign the published binary. Requires -PfxPath and will prompt
     for the PFX password at sign time.
@@ -34,7 +34,7 @@ Set-StrictMode -Version Latest
 $ProjectRoot = $PSScriptRoot
 $ProjectFile = Join-Path $ProjectRoot 'McpSitter.csproj'
 $DistDir = Join-Path $ProjectRoot 'dist'
-$NpmDistDir = Join-Path $ProjectRoot 'npm\dist'
+$NpmWin32BinDir = Join-Path $ProjectRoot 'npm\platforms\win32-x64\bin'
 
 Write-Host '=== mcp-sitter Release Publish ===' -ForegroundColor Cyan
 
@@ -74,9 +74,9 @@ if ($Sign) {
     Write-Host "`n[3/4] Skipping signing (pass -Sign to enable, e.g. for publish builds)." -ForegroundColor Gray
 }
 
-Write-Host "`n[4/4] Deploying to npm/dist..." -ForegroundColor Yellow
-$dst = Join-Path $NpmDistDir 'mcp-sitter.exe'
-New-Item -ItemType Directory -Force -Path $NpmDistDir | Out-Null
+Write-Host "`n[4/4] Deploying to npm/platforms/win32-x64/bin..." -ForegroundColor Yellow
+$dst = Join-Path $NpmWin32BinDir 'mcp-sitter.exe'
+New-Item -ItemType Directory -Force -Path $NpmWin32BinDir | Out-Null
 Copy-Item $src $dst -Force
 $size = [Math]::Round((Get-Item $dst).Length / 1MB, 2)
 Write-Host "      Copied to $dst ($size MB)" -ForegroundColor Green
