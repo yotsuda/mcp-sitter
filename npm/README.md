@@ -4,6 +4,29 @@ A hot-reload bridge for stdio **Model Context Protocol (MCP)** servers, so you
 can rebuild your MCP server during development **without restarting the MCP
 client** (e.g. Claude Code, Claude Desktop, Cursor, Cline, etc).
 
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/9ae83915-2a07-4d09-a614-cbae4443a792" alt="social-image" width="640" />
+</div>
+
+Install `mcp-sitter` (`npm install -g @ytsuda/mcp-sitter`), then point Claude
+Code at it:
+
+```powershell
+claude mcp add --scope user my-baby-dev `
+    mcp-sitter `
+    C:\path\to\my-baby-mcp.exe [args...]
+```
+
+That's the entire setup. Your tools are now available as `mcp__my-baby-dev__*`.
+Rebuild your server any time — call `sitter_kill` to unlock the binary, run
+your build, and the next tool call lazily respawns the child. No client
+restart, no lost conversation context, and the AI sees a `[mcp-sitter]`
+notice with the tools-diff so it self-corrects after schema changes.
+
+> Other MCP clients (Claude Desktop, Cursor, Cline, ...) work the same way:
+> point the client at `mcp-sitter` and pass your server exe + args.
+> Building from source instead? See [Build from source](#build-from-source).
+
 Point your MCP client at `mcp-sitter` instead of your in-development server.
 `mcp-sitter` spawns your server as a child process and proxies all JSON-RPC
 messages. When you need to rebuild, call `sitter_kill` to unlock the binary
@@ -146,8 +169,6 @@ JSON-RPC handshake:
 - `mcp-sitter core` — tools/list merging, tool forwarding, `sitter_kill` +
   lazy respawn with `[mcp-sitter]` restart notice injection, post-respawn
   `sitter_status` deltas.
-- `mcp-sitter file watcher` — `FileSystemWatcher` detects a binary touch
-  and kills the child; next tool/call lazily respawns.
 - `sitter_child_stderr` — startup stderr capture, mid-lifecycle lines via
   a `fake_log` tool, `since_spawn=true` filter, `since_spawn=false` with a
   `----- child respawn (gen N, pid P) -----` delimiter between generations.
@@ -171,24 +192,19 @@ workflow artifacts.
 
 | Tool                  | What it does |
 | --------------------- | ------------ |
-| `sitter_status`       | Returns child state, watched path, binary path/version, child PID, per-spawn and sitter uptimes, spawn/kill counts (including external / crash deaths), last kill reason/time, last startup duration, previous exit info, and last tools-diff summary. |
+| `sitter_status`       | Returns child state, binary path/version, child PID, per-spawn and sitter uptimes, spawn/kill counts (including external / crash deaths), last kill reason/time, last startup duration, previous exit info, and last tools-diff summary. |
 | `sitter_kill`         | Kills the child AND every other process running the same executable, so the binary is unlocked for rebuild. The child is lazily respawned on the next tool call. |
-| `sitter_binary_info`  | Returns version, build date (mtime), size, and metadata of the watched child binary. Use this to confirm which build is currently loaded and to detect stale binaries. |
+| `sitter_binary_info`  | Returns version, build date (mtime), size, and metadata of the child binary. Use this to confirm which build is currently loaded and to detect stale binaries. |
 | `sitter_child_stderr` | Tails the child MCP server's stderr from a bounded ring buffer (~1000 lines, persisted across respawns). Crucial for diagnosing child startup failures and crashes — pair with `sitter_status` after a non-zero `previousExitCode`. |
 
 Everything else (`tools/list`, `tools/call` for non-built-in tools, `ping`,
 `notifications/*`, `resources/*`, `prompts/*`, etc.) is forwarded
 transparently between the client and the child.
 
-## Install
+## Build from source
 
-Prebuilt Windows x64 binary via npm (recommended):
-
-```bash
-npm install -g @ytsuda/mcp-sitter
-```
-
-Or build from source (requires .NET 9 SDK):
+Requires .NET 9 SDK. Most users should prefer the npm prebuilt binary shown
+at the top of this README.
 
 ```powershell
 git clone https://github.com/yotsuda/mcp-sitter.git
@@ -199,30 +215,16 @@ cd mcp-sitter
 The AOT binary lands at `dist/mcp-sitter.exe` (and is mirrored to
 `npm/dist/mcp-sitter.exe` for the npm package).
 
-## Register with Claude Code
-
-```powershell
-claude mcp add --scope user my-server `
-    mcp-sitter `
-    C:\path\to\your-mcp-server.exe [your-server-args...]
-```
-
-Then from any Claude Code session, your MCP server is available as
-`mcp__my-server__*`. Rebuild your server at any time; the AI will see the
-new tools on its next turn and self-correct after schema changes.
-
 ## CLI
 
 ```
 mcp-sitter [options] [--] <child-exe> [child-args...]
 ```
 
-| Option            | Description |
-| ----------------- | ----------- |
-| `--watch <path>`  | Path to the binary to watch. Defaults to `<child-exe>` if that resolves to an existing file. |
-| `--debounce <ms>` | Debounce window for file-watcher events before killing the child. Default `1500`. |
-| `--cwd <path>`    | Working directory for the child process. Defaults to `mcp-sitter`'s cwd. |
-| `--help`, `-h`    | Show help. |
+| Option         | Description |
+| -------------- | ----------- |
+| `--cwd <path>` | Working directory for the child process. Defaults to `mcp-sitter`'s cwd. |
+| `--help`, `-h` | Show help. |
 
 Use `--` to separate `mcp-sitter` options from the child command if any
 child argument happens to start with `--`.
@@ -247,23 +249,15 @@ a spawn:
 5. When the child responds to the original request, prepend a
    `[mcp-sitter]` notice to `result.content[0]` and forward.
 
-This eliminates all debounce/timing issues with proactive reload — no risk
-of respawning while the build is still writing files.
+This eliminates all timing issues with proactive reload — no risk of
+respawning while the build is still writing files.
 
 ### `sitter_kill`
 
-Kills all processes running the watched executable — not just the child
+Kills all processes running the child executable — not just the one
 `mcp-sitter` spawned. This ensures the binary is fully unlocked for the
 build tool. Process matching is by `MainModule.FileName` comparison
 (case-insensitive, full-path).
-
-### File watcher
-
-`mcp-sitter` also installs a `FileSystemWatcher` on the binary path. On
-Linux/macOS, where a running executable is not locked, this kicks in and
-kills the child on a debounced timer when the binary is replaced. On
-Windows the running `.exe` is locked, so the watcher is effectively a
-no-op — you unlock the binary via `sitter_kill` instead.
 
 ### During downtime
 
@@ -299,9 +293,9 @@ so the AI's tool roster stays stable.
 mcp-sitter/
   Program.cs                        entry + CLI help
   Sitter.cs                         core: stdio pumps, message routing,
-                                    child lifecycle, file watcher, lazy
-                                    spawn + handshake replay, restart
-                                    notice, tools-diff, stderr ring buffer
+                                    child lifecycle, lazy spawn +
+                                    handshake replay, restart notice,
+                                    tools-diff, stderr ring buffer
   SitterTools.cs                    sitter_status / sitter_kill /
                                     sitter_binary_info / sitter_child_stderr
                                     tool definitions
