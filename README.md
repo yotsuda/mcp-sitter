@@ -12,12 +12,12 @@ Install `mcp-sitter` (`npm install -g @ytsuda/mcp-sitter`), then point Claude
 Code at it:
 
 ```powershell
-claude mcp add --scope user my-server `
+claude mcp add --scope user my-baby-dev `
     mcp-sitter `
-    C:\path\to\your-baby-mcp-server.exe [args...]
+    C:\path\to\my-baby-mcp.exe [args...]
 ```
 
-That's the entire setup. Your tools are now available as `mcp__my-server__*`.
+That's the entire setup. Your tools are now available as `mcp__my-baby-dev__*`.
 Rebuild your server any time — call `sitter_kill` to unlock the binary, run
 your build, and the next tool call lazily respawns the child. No client
 restart, no lost conversation context, and the AI sees a `[mcp-sitter]`
