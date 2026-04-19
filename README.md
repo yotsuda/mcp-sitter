@@ -4,6 +4,10 @@ A hot-reload bridge for stdio **Model Context Protocol (MCP)** servers, so you
 can rebuild your MCP server during development **without restarting the MCP
 client** (e.g. Claude Code, Claude Desktop, Cursor, Cline, etc).
 
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/9ae83915-2a07-4d09-a614-cbae4443a792" alt="social-image" width="640" />
+</div>
+
 Point your MCP client at `mcp-sitter` instead of your in-development server.
 `mcp-sitter` spawns your server as a child process and proxies all JSON-RPC
 messages. When you need to rebuild, call `sitter_kill` to unlock the binary
