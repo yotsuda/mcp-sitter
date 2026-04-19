@@ -2,8 +2,8 @@
 # Pester v5 integration tests for mcp-sitter.
 #
 # Exercises the full MCP handshake against the sitter-with-FakeMcp pipeline:
-# tools/list merging, tool forwarding, sitter_kill + lazy respawn, binary
-# watcher, and the sitter_child_stderr ring buffer.
+# tools/list merging, tool forwarding, sitter_kill + lazy respawn, and the
+# sitter_child_stderr ring buffer.
 #
 # Prerequisites:
 #   dotnet build -c Debug
@@ -142,37 +142,6 @@ Describe "mcp-sitter core" {
         $status.spawnCount | Should -BeGreaterOrEqual 2
         $status.killCount | Should -BeGreaterOrEqual 1
         $status.childReady | Should -BeTrue
-    }
-}
-
-Describe "mcp-sitter file watcher" {
-    BeforeAll {
-        $script:p = Start-Sitter @('--debounce','500')
-        Invoke-Handshake $script:p
-        $script:nextId = 200
-    }
-    AfterAll {
-        Stop-Sitter $script:p
-    }
-
-    It "starts with killCount=0" {
-        $r = Call-Tool $script:p ($script:nextId++) 'sitter_status' @{}
-        ($r.result.content[0].text | ConvertFrom-Json).killCount | Should -Be 0
-    }
-
-    It "kills the child after a binary touch" {
-        (Get-Item $script:childExe).LastWriteTime = Get-Date
-        Start-Sleep -Seconds 3
-        $r = Call-Tool $script:p ($script:nextId++) 'sitter_status' @{} 15
-        $status = $r.result.content[0].text | ConvertFrom-Json
-        $status.killCount | Should -BeGreaterOrEqual 1
-        $status.lastKillReason | Should -Match 'binary'
-    }
-
-    It "lazily respawns on the next tool/call after a watcher kill" {
-        $r = Call-Tool $script:p ($script:nextId++) 'fake_echo' @{ text = 'post-touch' } 15
-        $texts = @($r.result.content | ForEach-Object { $_.text })
-        $texts | Should -Contain 'echo: post-touch'
     }
 }
 

@@ -13,7 +13,7 @@ public static class SitterTools
         (JsonNode?)new JsonObject
         {
             ["name"] = Status,
-            ["description"] = "Show mcp-sitter status: child MCP server state, watched binary path, kill/spawn counts, last startup duration, and previous exit info.",
+            ["description"] = "Show mcp-sitter status: child MCP server state, child binary path, kill/spawn counts, last startup duration, and previous exit info.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -35,7 +35,7 @@ public static class SitterTools
         (JsonNode?)new JsonObject
         {
             ["name"] = BinaryInfo,
-            ["description"] = "Show version, build date (mtime), size, and other metadata of the watched child binary. Use this to confirm which build is currently loaded and to detect stale binaries.",
+            ["description"] = "Show version, build date (mtime), size, and other metadata of the child binary. Use this to confirm which build is currently loaded and to detect stale binaries.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -46,7 +46,7 @@ public static class SitterTools
         (JsonNode?)new JsonObject
         {
             ["name"] = ChildStderr,
-            ["description"] = "Tail the watched child MCP server's stderr (bounded ring buffer of ~1000 lines, persisted across child respawns). Use after `sitter_status` reports a non-zero `previousExitCode` or `child failed to start`, to retrieve the crash stack trace / error output from the child.",
+            ["description"] = "Tail the child MCP server's stderr (bounded ring buffer of ~1000 lines, persisted across child respawns). Use after `sitter_status` reports a non-zero `previousExitCode` or `child failed to start`, to retrieve the crash stack trace / error output from the child.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",

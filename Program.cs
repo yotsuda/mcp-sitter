@@ -49,27 +49,27 @@ Usage:
   mcp-sitter [options] [--] <child-exe> [child-args...]
 
 Options:
-  --watch <path>       Binary to watch (default: <child-exe> if it is a file)
-  --debounce <ms>      Debounce after a write before respawning (default 1500)
   --cwd <path>         Working directory for the child
   --help, -h           Show this help
 
 mcp-sitter speaks MCP over stdio to its parent (e.g. Claude Code) and
 forwards to a child stdio MCP server. When the child is killed (by
-sitter_kill, by a build, or by the file watcher), it is lazily
-respawned on the next tool call. If the tool set changed, the parent
-is notified via notifications/tools/list_changed.
+sitter_kill or by crashing), it is lazily respawned on the next tool
+call. If the tool set changed, the parent is notified via
+notifications/tools/list_changed.
 
 Built-in tools exposed to the parent:
-  sitter_status        Show child status, watched binary, spawn counts,
-                       last startup time, and previous exit info
-  sitter_kill          Kill the child and all processes running the same exe
-                       so the binary can be rebuilt
-  sitter_binary_info   Show version, build date, and metadata of the child
-                       binary — useful for detecting stale builds
+  sitter_status         Show child status, binary path/version, spawn
+                        counts, last startup time, and previous exit info
+  sitter_kill           Kill the child and all processes running the same
+                        exe so the binary can be rebuilt
+  sitter_binary_info    Show version, build date, and metadata of the
+                        child binary — useful for detecting stale builds
+  sitter_child_stderr   Tail the child's stderr from a bounded ring
+                        buffer (lines persist across respawns)
 
 After a restart, the first tool/call response is annotated with a
 [mcp-sitter] notice describing the new spawn (startup time, binary
-version/age, previous exit, and tools-list diff).");
+path + version/age, previous exit, and tools-list diff).");
     }
 }

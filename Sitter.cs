@@ -52,11 +52,6 @@ public sealed class Sitter
     readonly HashSet<string> _pendingClientToolsList = new();
     readonly object _toolsListLock = new();
 
-    // file watcher
-    FileSystemWatcher? _watcher;
-    CancellationTokenSource? _debounceCts;
-    readonly object _debounceLock = new();
-
     // restart notice tracking
     DateTime? _spawnStartedUtc;
     TimeSpan? _lastStartupDuration;
@@ -76,12 +71,6 @@ public sealed class Sitter
 
         Log.Info("mcp-sitter starting");
         Log.Info($"child: {_config.ChildCommand} {string.Join(" ", _config.ChildArgs)}");
-        if (_config.WatchPath != null)
-            Log.Info($"watch: {_config.WatchPath} (debounce {_config.DebounceMs}ms)");
-        else
-            Log.Warn("no watch path resolved; file-watch disabled");
-
-        SetupWatcher();
 
         var writer = Task.Run(() => ClientWriterLoop(token), token);
         var reader = Task.Run(() => ClientReaderLoop(token), token);
@@ -321,7 +310,6 @@ public sealed class Sitter
         {
             ["childCommand"] = _config.ChildCommand,
             ["childArgs"] = argsArr,
-            ["watchPath"] = _config.WatchPath,
             ["workingDirectory"] = _config.WorkingDirectory,
             ["binaryPath"] = ResolveChildExePath(),
             ["binaryVersion"] = GetBinaryVersion(ResolveChildExePath()),
@@ -420,9 +408,9 @@ public sealed class Sitter
             var candidate = Path.IsPathRooted(cmd)
                 ? cmd
                 : Path.Combine(_config.WorkingDirectory ?? Environment.CurrentDirectory, cmd);
-            return File.Exists(candidate) ? Path.GetFullPath(candidate) : _config.WatchPath;
+            return File.Exists(candidate) ? Path.GetFullPath(candidate) : null;
         }
-        catch { return _config.WatchPath; }
+        catch { return null; }
     }
 
     static JsonObject TextContent(string text) => new()
@@ -799,57 +787,6 @@ public sealed class Sitter
         }
 
         await SendToClientAsync(line);
-    }
-
-    // =================================================================
-    // file watcher (kill only, no respawn)
-    // =================================================================
-
-    void SetupWatcher()
-    {
-        if (_config.WatchPath == null) return;
-        var dir = Path.GetDirectoryName(_config.WatchPath);
-        var file = Path.GetFileName(_config.WatchPath);
-        if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(file)) return;
-        try
-        {
-            _watcher = new FileSystemWatcher(dir, file)
-            {
-                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size |
-                               NotifyFilters.CreationTime | NotifyFilters.FileName,
-                EnableRaisingEvents = true,
-            };
-            _watcher.Changed += OnBinaryChanged;
-            _watcher.Created += OnBinaryChanged;
-            _watcher.Renamed += (s, e) => OnBinaryChanged(s, e);
-        }
-        catch (Exception ex) { Log.Warn($"watcher setup failed: {ex.Message}"); }
-    }
-
-    void OnBinaryChanged(object sender, FileSystemEventArgs e)
-    {
-        if (!_childAlive) return;
-        Log.Info($"binary change: {e.ChangeType} {e.Name}; killing child");
-        lock (_debounceLock)
-        {
-            _debounceCts?.Cancel();
-            _debounceCts = new CancellationTokenSource();
-            var token = _debounceCts.Token;
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(_config.DebounceMs, token);
-                    _lastKillReason = "binary changed";
-                    _killCount++;
-                    _lastKillUtc = DateTime.UtcNow;
-                    await KillChildAsync();
-                    Log.Info("child killed by file watcher");
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex) { Log.Error($"watcher kill: {ex}"); }
-            }, token);
-        }
     }
 
     // =================================================================
