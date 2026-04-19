@@ -78,7 +78,7 @@ jobs:
           if-no-files-found: error
 
   publish-npm:
-    # Publishes @ytsuda/mcp-sitter to npmjs.com with SLSA provenance via
+    # Publishes mcp-sitter to npmjs.com with SLSA provenance via
     # OIDC-based Trusted Publisher (no NPM_TOKEN anywhere).
     #
     # Prerequisites (one-time setup on npmjs.com, after initial manual publish):

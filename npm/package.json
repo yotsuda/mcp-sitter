@@ -1,5 +1,5 @@
 {
-  "name": "@ytsuda/mcp-sitter",
+  "name": "mcp-sitter",
   "version": "0.1.0",
   "description": "Hot-reload bridge for stdio MCP servers. Rebuild your MCP server without restarting the MCP client. Injects restart notices and tools-list diffs into tool/call responses so the AI self-corrects after schema changes.",
   "license": "MIT",

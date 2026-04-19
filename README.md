@@ -8,8 +8,8 @@ client** (e.g. Claude Code, Claude Desktop, Cursor, Cline, etc).
   <img src="https://github.com/user-attachments/assets/9ae83915-2a07-4d09-a614-cbae4443a792" alt="social-image" width="640" />
 </div>
 
-Install `mcp-sitter` (`npm install -g @ytsuda/mcp-sitter`), then point Claude
-Code at it:
+Install `mcp-sitter` (`npm install -g mcp-sitter`), then point Claude Code
+at it:
 
 ```powershell
 claude mcp add --scope user my-baby-dev `
