@@ -179,14 +179,16 @@ dotnet build test/FakeMcp/FakeMcp.csproj -c Debug
 Invoke-Pester test/McpSitter.Tests.ps1 -Output Detailed
 ```
 
-CI runs the same Pester suite on **Windows / Ubuntu** matrix via
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml). Tagged releases
-additionally run an AOT `dotnet publish` for each native RID
-(win-x64 / linux-x64), upload the binaries as workflow artifacts, and
-publish them to npm as platform-specific sub-packages
-(`mcp-sitter-win32-x64`, `mcp-sitter-linux-x64`) which the umbrella
-`mcp-sitter` package resolves at runtime via its `optionalDependencies`.
-macOS support is deferred to a future version.
+CI runs the same Pester suite on **Windows / Ubuntu / macOS** matrix
+via [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Tagged
+releases run `.github/workflows/release.yml` — a three-job flow that
+NativeAOT-publishes for each RID (win-x64 / linux-x64 / osx-arm64),
+Authenticode-signs the Windows binary via Azure Key Vault on a
+Windows runner, and publishes three platform-specific npm
+sub-packages (`@ytsuda/mcp-sitter-win32-x64`, `@ytsuda/mcp-sitter-linux-x64`,
+`@ytsuda/mcp-sitter-darwin-arm64`) plus the umbrella `mcp-sitter`
+package, all with SLSA provenance. The umbrella resolves the
+matching sub-package at runtime via its `optionalDependencies`.
 
 ## Built-in tools
 
@@ -322,10 +324,10 @@ mcp-sitter/
     bin/cli.mjs                     resolves mcp-sitter-<platform>-<arch>
                                     at runtime via require.resolve
     platforms/
-      win32-x64/     package.json   mcp-sitter-win32-x64 (os/cpu pinned);
+      win32-x64/     package.json   @ytsuda/mcp-sitter-win32-x64 (os/cpu pinned);
                                     bin/mcp-sitter.exe populated by CI
-      linux-x64/     package.json   mcp-sitter-linux-x64; bin/ populated by CI
-      darwin-arm64/  package.json   mcp-sitter-darwin-arm64; bin/ populated by CI
+      linux-x64/     package.json   @ytsuda/mcp-sitter-linux-x64; bin/ populated by CI
+      darwin-arm64/  package.json   @ytsuda/mcp-sitter-darwin-arm64; bin/ populated by CI
 ```
 
 The .NET namespace and types are `McpSitter` / `Sitter` (PascalCase, .NET

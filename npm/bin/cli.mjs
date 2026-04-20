@@ -23,9 +23,9 @@ const require = createRequire(import.meta.url);
 // Keep this map in sync with the meta package.json's
 // optionalDependencies list and with the workflow matrix.
 const PLATFORM_PACKAGES = {
-  "win32-x64":    { pkg: "mcp-sitter-win32-x64",    exe: "mcp-sitter.exe" },
-  "linux-x64":    { pkg: "mcp-sitter-linux-x64",    exe: "mcp-sitter" },
-  "darwin-arm64": { pkg: "mcp-sitter-darwin-arm64", exe: "mcp-sitter" },
+  "win32-x64":    { pkg: "@ytsuda/mcp-sitter-win32-x64",    exe: "mcp-sitter.exe" },
+  "linux-x64":    { pkg: "@ytsuda/mcp-sitter-linux-x64",    exe: "mcp-sitter" },
+  "darwin-arm64": { pkg: "@ytsuda/mcp-sitter-darwin-arm64", exe: "mcp-sitter" },
 };
 
 const key = `${process.platform}-${process.arch}`;

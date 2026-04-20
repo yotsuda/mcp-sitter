@@ -1,4 +1,4 @@
-# mcp-sitter-linux-x64
+# @ytsuda/mcp-sitter-linux-x64
 
 Linux x64 (AMD64) native binary for [`mcp-sitter`](https://www.npmjs.com/package/mcp-sitter) — a hot-reload bridge for stdio MCP (Model Context Protocol) servers. Exposes `sitter_status`, `sitter_kill`, `sitter_binary_info`, and `sitter_child_stderr` tools alongside any MCP server it supervises, so the AI can request a child-process rebuild without the host application losing its MCP connection.
 

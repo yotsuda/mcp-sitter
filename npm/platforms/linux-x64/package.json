@@ -1,5 +1,5 @@
 {
-  "name": "mcp-sitter-linux-x64",
+  "name": "@ytsuda/mcp-sitter-linux-x64",
   "version": "0.2.0",
   "description": "Linux x64 native binary for mcp-sitter. Installed automatically as an optional dependency of the mcp-sitter package.",
   "license": "MIT",

@@ -253,8 +253,8 @@ releases run `.github/workflows/release.yml` — a three-job flow that
 NativeAOT-publishes for each RID (win-x64 / linux-x64 / osx-arm64),
 Authenticode-signs the Windows binary via Azure Key Vault on a
 Windows runner, and publishes three platform-specific npm
-sub-packages (`mcp-sitter-win32-x64`, `mcp-sitter-linux-x64`,
-`mcp-sitter-darwin-arm64`) plus the umbrella `mcp-sitter` package,
+sub-packages (`@ytsuda/mcp-sitter-win32-x64`, `@ytsuda/mcp-sitter-linux-x64`,
+`@ytsuda/mcp-sitter-darwin-arm64`) plus the umbrella `mcp-sitter` package,
 all with SLSA provenance. The umbrella resolves the matching
 sub-package at runtime via its `optionalDependencies`.
 
@@ -394,10 +394,10 @@ mcp-sitter/
     bin/cli.mjs                     resolves mcp-sitter-<platform>-<arch>
                                     at runtime via require.resolve
     platforms/
-      win32-x64/     package.json   mcp-sitter-win32-x64 (os/cpu pinned);
+      win32-x64/     package.json   @ytsuda/mcp-sitter-win32-x64 (os/cpu pinned);
                                     bin/mcp-sitter.exe populated by CI
-      linux-x64/     package.json   mcp-sitter-linux-x64; bin/ populated by CI
-      darwin-arm64/  package.json   mcp-sitter-darwin-arm64; bin/ populated by CI
+      linux-x64/     package.json   @ytsuda/mcp-sitter-linux-x64; bin/ populated by CI
+      darwin-arm64/  package.json   @ytsuda/mcp-sitter-darwin-arm64; bin/ populated by CI
 ```
 
 The .NET namespace and types are `McpSitter` / `Sitter` (PascalCase, .NET

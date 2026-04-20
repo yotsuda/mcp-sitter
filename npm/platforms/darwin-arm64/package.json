@@ -1,5 +1,5 @@
 {
-  "name": "mcp-sitter-darwin-arm64",
+  "name": "@ytsuda/mcp-sitter-darwin-arm64",
   "version": "0.2.0",
   "description": "macOS Apple Silicon (arm64) native binary for mcp-sitter. Installed automatically as an optional dependency of the mcp-sitter package.",
   "license": "MIT",

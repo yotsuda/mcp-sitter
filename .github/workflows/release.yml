@@ -209,7 +209,7 @@ jobs:
         run: |
           set -euo pipefail
           for plat in win32-x64 linux-x64 darwin-arm64; do
-            echo "=== publishing mcp-sitter-${plat} ==="
+            echo "=== publishing @ytsuda/mcp-sitter-${plat} ==="
             (cd "npm/platforms/${plat}" && npm publish --access public --provenance)
           done
 

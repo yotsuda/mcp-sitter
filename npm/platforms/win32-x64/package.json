@@ -1,5 +1,5 @@
 {
-  "name": "mcp-sitter-win32-x64",
+  "name": "@ytsuda/mcp-sitter-win32-x64",
   "version": "0.2.0",
   "description": "Windows x64 native binary for mcp-sitter. Installed automatically as an optional dependency of the mcp-sitter package.",
   "license": "MIT",
