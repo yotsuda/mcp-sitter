@@ -215,10 +215,11 @@ cd mcp-sitter
 .\Build.ps1
 ```
 
-The AOT binary lands at `dist/mcp-sitter.exe` (and is mirrored to
-`npm/platforms/win32-x64/bin/mcp-sitter.exe` for the Windows npm
-sub-package). The Linux sub-package is built fresh on the runner in CI
-from the same `dotnet publish -c Release -r linux-x64` command.
+The AOT binary lands at `dist/mcp-sitter.exe`. Each release runs
+`dotnet publish` for all three platform RIDs (`win-x64` / `linux-x64` /
+`osx-arm64`) on matrix runners, Authenticode-signs the Windows binary
+via Azure Key Vault, and publishes per-platform npm sub-packages with
+SLSA provenance; see `.github/workflows/release.yml`.
 
 ## CLI
 
@@ -280,11 +281,11 @@ so the AI's tool roster stays stable.
   `resources/*` or `prompts/*` pass through transparently but the bridge
   does not issue a `notifications/resources/list_changed` after respawn on
   its own (yet).
-- **macOS is not yet supported.** v0.2.0 ships `win32-x64` and
-  `linux-x64` native binaries only; a `darwin-*` build is planned for a
-  future release. The Linux binary ships unsigned (Linux convention);
-  the Windows binary is Authenticode-signed by the project's
-  code-signing cert.
+- **Platform coverage.** v0.2.0 ships `win32-x64`, `linux-x64`, and
+  `darwin-arm64` (Apple Silicon) native binaries. Intel Mac is not
+  shipped. The Windows binary is Authenticode-signed by the project's
+  code-signing cert via Azure Key Vault; Linux and macOS binaries ship
+  unsigned (all three are covered by npm SLSA provenance).
 - **One child per bridge instance.** The child command is fixed at bridge
   startup; to supervise multiple MCP servers, register multiple `mcp-sitter`
   instances with different names.
@@ -308,23 +309,23 @@ mcp-sitter/
   SitterConfig.cs                   CLI argument parsing
   Log.cs                            stderr logger
   McpSitter.csproj                  net9.0 console app (AOT-published)
-  Build.ps1                         release-publish, optional Authenticode
-                                    signing, mirror to npm/platforms/win32-x64/bin
-  .github/workflows/ci.yml          Pester matrix + AOT publish on tag
+  Build.ps1                         local dev build
+  .github/workflows/ci.yml          Pester matrix (win/linux/macOS)
+  .github/workflows/release.yml     AOT build → Azure KV sign (Windows)
+                                    → npm publish + GitHub release
   test/
     McpSitter.Tests.ps1             Pester v5 integration tests
     FakeMcp/                        minimal stdio MCP server for tests
   npm/
     package.json                    umbrella mcp-sitter; optionalDependencies
-                                    pin both platform sub-packages
+                                    pin all 3 platform sub-packages
     bin/cli.mjs                     resolves mcp-sitter-<platform>-<arch>
                                     at runtime via require.resolve
     platforms/
-      win32-x64/
-        package.json                mcp-sitter-win32-x64 (os/cpu pinned)
-        bin/mcp-sitter.exe          signed locally via Build.ps1 -Sign,
-                                    committed (PFX never touches CI)
-      linux-x64/    package.json    bin/ populated by CI per runner
+      win32-x64/     package.json   mcp-sitter-win32-x64 (os/cpu pinned);
+                                    bin/mcp-sitter.exe populated by CI
+      linux-x64/     package.json   mcp-sitter-linux-x64; bin/ populated by CI
+      darwin-arm64/  package.json   mcp-sitter-darwin-arm64; bin/ populated by CI
 ```
 
 The .NET namespace and types are `McpSitter` / `Sitter` (PascalCase, .NET

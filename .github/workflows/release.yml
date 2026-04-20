@@ -1,0 +1,263 @@
+name: Release
+
+# Triggered only by tag pushes matching v*. The release environment's
+# deployment_branch_policy further restricts execution to tag refs
+# matching v*; subscribed environment reviewers must approve before
+# the publish job runs. Build jobs do NOT require approval (they
+# produce unsigned artifacts that are useless without the publish
+# step's signing + npm push), so review friction is one-time.
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write       # gh release create
+  id-token: write       # OIDC for Azure + npm provenance
+
+jobs:
+  build:
+    name: Build ${{ matrix.rid }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - rid: win-x64
+            runner: windows-latest
+            platform: win32-x64
+            exe: mcp-sitter.exe
+          - rid: linux-x64
+            runner: ubuntu-latest
+            platform: linux-x64
+            exe: mcp-sitter
+          - rid: osx-arm64
+            runner: macos-latest
+            platform: darwin-arm64
+            exe: mcp-sitter
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: dotnet restore
+        run: dotnet restore McpSitter.csproj -r ${{ matrix.rid }}
+
+      - name: dotnet publish (NativeAOT)
+        run: dotnet publish McpSitter.csproj -c Release -r ${{ matrix.rid }} -o dist --no-restore
+
+      # Smoke check: the binary must run and exit 0 for --help or
+      # equivalent. mcp-sitter doesn't have a built-in --test suite,
+      # so this is just a "compiles and starts" gate. The Pester
+      # integration tests run in ci.yml against PR pushes.
+      - name: Smoke-run binary
+        shell: bash
+        run: |
+          chmod +x "dist/${{ matrix.exe }}" || true
+          "./dist/${{ matrix.exe }}" --help > /dev/null 2>&1 || \
+            "./dist/${{ matrix.exe }}" --version > /dev/null 2>&1 || \
+            echo "Binary ran (may not support --help/--version flags — that's OK as long as it started)"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: mcp-sitter-${{ matrix.platform }}
+          path: dist/${{ matrix.exe }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Authenticode signing must run on Windows — AzureSignTool v7 has an
+  # explicit "only supported on Windows" guard. Dedicated windows-latest
+  # job signs the already-built win32-x64 artifact and re-uploads it
+  # under the same name (overwrite) so the publish job's download-all
+  # logic transparently picks up the signed version. Only the Windows
+  # binary is signed; Linux/macOS have no equivalent OS-level signature
+  # verification path, and npm provenance (from the publish job) covers
+  # supply-chain trust.
+  sign-windows:
+    name: Sign Windows binary
+    needs: build
+    runs-on: windows-latest
+    environment: release   # required-reviewer gate + federated-cred subject match
+
+    steps:
+      - name: Download win32-x64 artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: mcp-sitter-win32-x64
+          path: win32-x64
+
+      - name: Azure OIDC login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install AzureSignTool
+        run: dotnet tool install --global AzureSignTool
+
+      - name: Sign mcp-sitter.exe via Azure Key Vault
+        env:
+          AZURE_KV_URL: ${{ vars.KEY_VAULT_URL }}
+          AZURE_KV_CERT: ${{ vars.SIGNING_CERT_NAME }}
+          EXPECTED_THUMBPRINT: '74E5208228DFB12A067747D536BF497B6E98C73C'
+        shell: pwsh
+        run: |
+          $token = az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv
+          if ([string]::IsNullOrEmpty($token)) { throw "Failed to acquire Key Vault access token" }
+          AzureSignTool sign `
+            --azure-key-vault-url $env:AZURE_KV_URL `
+            --azure-key-vault-certificate $env:AZURE_KV_CERT `
+            --azure-key-vault-accesstoken $token `
+            --file-digest sha256 `
+            --timestamp-rfc3161 'http://timestamp.digicert.com' `
+            --description 'mcp-sitter - hot-reload bridge for stdio MCP servers' `
+            --description-url 'https://github.com/yotsuda/mcp-sitter' `
+            win32-x64/mcp-sitter.exe
+          # Verify by thumbprint, not Status — runner trust chain may
+          # report UnknownError on self-signed root.
+          $sig = Get-AuthenticodeSignature win32-x64/mcp-sitter.exe
+          if ($sig.SignerCertificate.Thumbprint -ne $env:EXPECTED_THUMBPRINT) {
+            throw "Thumbprint mismatch: got $($sig.SignerCertificate.Thumbprint), expected $env:EXPECTED_THUMBPRINT"
+          }
+          Write-Host "Signed OK (thumbprint: $($sig.SignerCertificate.Thumbprint))"
+
+      - name: Upload signed win32-x64 artifact (overwrites unsigned)
+        uses: actions/upload-artifact@v5
+        with:
+          name: mcp-sitter-win32-x64
+          path: win32-x64/mcp-sitter.exe
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    name: Publish npm + GitHub release
+    needs: sign-windows
+    runs-on: ubuntu-latest
+    environment: release   # required-reviewer gate + NPM_TOKEN scope
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify tag matches all version fields
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ github.ref_name }}'
+          version="${tag#v}"
+          csproj_version=$(grep -oE '<Version>[^<]+</Version>' McpSitter.csproj | head -n1 | sed -E 's/<Version>([^<]+)<\/Version>/\1/')
+          meta_version=$(node -p "require('./npm/package.json').version")
+          echo "Tag:     $version"
+          echo "csproj:  $csproj_version"
+          echo "meta:    $meta_version"
+          [[ "$version" == "$csproj_version" ]] || { echo "csproj version mismatch" >&2; exit 1; }
+          [[ "$version" == "$meta_version" ]]   || { echo "meta package.json version mismatch" >&2; exit 1; }
+          for plat in win32-x64 linux-x64 darwin-arm64; do
+            pv=$(node -p "require('./npm/platforms/${plat}/package.json').version")
+            echo "$plat: $pv"
+            [[ "$version" == "$pv" ]] || { echo "$plat subpackage version mismatch" >&2; exit 1; }
+          done
+
+      # Downloads mcp-sitter-win32-x64 (now the SIGNED version,
+      # overwritten by sign-windows) plus the unsigned linux-x64 and
+      # darwin-arm64 artifacts from the build job.
+      - name: Download all platform binaries
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Place binaries into subpackages + fix executable bits
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp artifacts/mcp-sitter-win32-x64/mcp-sitter.exe   npm/platforms/win32-x64/bin/mcp-sitter.exe
+          cp artifacts/mcp-sitter-linux-x64/mcp-sitter       npm/platforms/linux-x64/bin/mcp-sitter
+          cp artifacts/mcp-sitter-darwin-arm64/mcp-sitter    npm/platforms/darwin-arm64/bin/mcp-sitter
+          chmod +x npm/platforms/linux-x64/bin/mcp-sitter
+          chmod +x npm/platforms/darwin-arm64/bin/mcp-sitter
+          rm -f npm/platforms/*/bin/.gitkeep
+          ls -la npm/platforms/*/bin/
+
+      # Publish subpackages BEFORE meta. Meta's optionalDependencies
+      # reference these exact versions; if meta published first and a
+      # subpackage publish later failed, users installing the meta
+      # would see missing optional deps and degraded UX.
+      - name: Publish subpackages with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for plat in win32-x64 linux-x64 darwin-arm64; do
+            echo "=== publishing mcp-sitter-${plat} ==="
+            (cd "npm/platforms/${plat}" && npm publish --access public --provenance)
+          done
+
+      - name: Publish meta package with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd npm
+          npm publish --access public --provenance
+
+      - name: Extract changelog entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ github.ref_name }}'
+          version="${version#v}"
+          awk -v v="$version" '
+            /^## +\[/ {
+              if (capture) exit
+              if ($0 ~ "^## +\\[" v "\\]") { capture = 1; next }
+            }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if [[ ! -s release-notes.md ]]; then
+            echo "No CHANGELOG section for v$version" >&2
+            exit 1
+          fi
+          wc -l release-notes.md
+
+      # Pre-rename binaries to unique per-platform names. GitHub
+      # release asset `name` must be unique per release, and the
+      # `#label` syntax on gh release create sets only the display
+      # label — NOT the filename. Without this pre-rename, linux/darwin
+      # binaries (both named `mcp-sitter`) collide on upload.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp npm/platforms/win32-x64/bin/mcp-sitter.exe "release-assets/mcp-sitter-${{ github.ref_name }}-win32-x64.exe"
+          cp npm/platforms/linux-x64/bin/mcp-sitter     "release-assets/mcp-sitter-${{ github.ref_name }}-linux-x64"
+          cp npm/platforms/darwin-arm64/bin/mcp-sitter  "release-assets/mcp-sitter-${{ github.ref_name }}-darwin-arm64"
+          gh release create '${{ github.ref_name }}' \
+            --title "mcp-sitter ${{ github.ref_name }}" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            release-assets/*

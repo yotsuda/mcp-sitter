@@ -9,14 +9,18 @@ obj/
 
 ## npm package bin/ exceptions:
 ## - npm/bin/         : the umbrella's cli.mjs wrapper, always tracked
-## - npm/platforms/win32-x64/bin/ : signed Win exe is committed (PFX
-##   never touches CI; sign locally via .\Build.ps1 -Sign).
-## The Linux platform bin dir stays ignored — CI builds it fresh on
-## the runner and publishes from the runner's working tree.
+## - npm/platforms/*/bin/.gitkeep : keep the subpackage bin/ dirs
+##   around in source so the scaffold doesn't drift, but never ship
+##   binaries in git. CI builds + (for Windows) Authenticode-signs
+##   the binaries on the runner and publishes from the runner's
+##   working tree.
 !npm/bin/
 !npm/bin/**
-!npm/platforms/win32-x64/bin/
-!npm/platforms/win32-x64/bin/**
+!npm/platforms/*/bin/
+!npm/platforms/*/bin/.gitkeep
+
+## npm pack artifacts
+*.tgz
 
 ## JetBrains Rider
 .idea/
