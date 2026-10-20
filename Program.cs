@@ -15,6 +15,9 @@ public static class Program
             return args.Length == 0 ? 1 : 0;
         }
 
+        if (args[0] == "add")
+            return AddCommand.Run(args[1..]);
+
         var config = SitterConfig.Parse(args);
         if (config is null)
         {
@@ -47,6 +50,9 @@ public static class Program
 
 Usage:
   mcp-sitter [options] [--] <child-exe> [child-args...]
+  mcp-sitter add <name> [options] [--] <child-exe> [child-args...]
+                           Register <name>-dev with Claude Code
+                           (mcp-sitter add --help for details)
 
 Options:
   --cwd <path>             Working directory for the child

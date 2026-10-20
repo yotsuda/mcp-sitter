@@ -6,6 +6,8 @@ All notable changes to mcp-sitter are documented here. Format based on [Keep a C
 
 ### Added
 
+- **`mcp-sitter add <name> <child-exe> [args...]`.** Registers `<name>-dev` with Claude Code (via `claude mcp add`), running the child behind this mcp-sitter. `-dev` is appended when missing, a child path is made absolute, `--from <server>` copies the env of an existing registration (`-e` overrides), sitter options (`--cwd`, `--reload-on`, `--no-reload-on-change`) are passed through, and `--dry-run` prints the command. A server added mid-session is not loaded until Claude Code starts again (`claude --continue` keeps the conversation); after that, rebuilds reload by themselves.
+
 - **Reload on change.** Before each `tools/call` / `tools/list`, mcp-sitter checks whether a new build has replaced the child's binary (size + last-write time of the exe and `<name>.dll` beside it). When it has, and the new files are completely written, it restarts its own child on them — no `sitter_kill` needed when the build can replace a running binary (on Windows: rename the old file aside, then copy the new one in). Nothing is watched in the background and nothing is stopped while a build writes, unlike the file watcher removed before 0.2.0. The restart notice says `binary changed`.
 - **`--reload-on <path>`** (repeatable) to name the files or directories that mark a new build, for script servers (`--reload-on dist`); **`--no-reload-on-change`** to turn reloading off.
 - `sitter_status` reports the watched files, whether they changed since the spawn, and the requests in flight.

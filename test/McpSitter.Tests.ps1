@@ -286,6 +286,57 @@ Describe "sitter_kill and other processes running the same exe" {
     }
 }
 
+Describe "mcp-sitter add" {
+    BeforeAll {
+        function Invoke-Add {
+            param([string[]]$AddArgs)
+            $out = & $script:relayExe add --dry-run @AddArgs 2>&1
+            [pscustomobject]@{ Code = $LASTEXITCODE; Text = ($out -join "`n") }
+        }
+        $script:fakeConfig = Join-Path $TestDrive 'claude.json'
+        @{ mcpServers = @{ myserver = @{ command = 'prod.exe'; env = @{ PIPE = 'PROD'; SHARED = 'from-prod' } } } } |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:fakeConfig
+        $env:MCP_SITTER_CLAUDE_JSON = $script:fakeConfig
+    }
+    AfterAll {
+        Remove-Item Env:MCP_SITTER_CLAUDE_JSON -ErrorAction SilentlyContinue
+    }
+
+    It "appends -dev to the name and registers the child behind this mcp-sitter" {
+        $r = Invoke-Add @('myserver', $script:childExe)
+        $r.Code | Should -Be 0
+        $r.Text | Should -Match '^claude mcp add --scope user myserver-dev -- '
+        $r.Text | Should -Match ([regex]::Escape([IO.Path]::GetFullPath($script:childExe)))
+    }
+
+    It "keeps a name that already ends in -dev" {
+        (Invoke-Add @('myserver-dev', $script:childExe)).Text | Should -Match ' myserver-dev -- '
+        (Invoke-Add @('myserver-dev', $script:childExe)).Text | Should -Not -Match 'myserver-dev-dev'
+    }
+
+    It "copies env from --from and lets -e override it" {
+        $r = Invoke-Add @('myserver', '--from', 'myserver', '-e', 'PIPE=DEV', $script:childExe)
+        $r.Code | Should -Be 0
+        $r.Text | Should -Match '-e SHARED=from-prod'
+        $r.Text | Should -Match '-e PIPE=DEV'
+        $r.Text | Should -Not -Match 'PIPE=PROD'
+    }
+
+    It "passes mcp-sitter options before the child and child args after it" {
+        $r = Invoke-Add @('myserver', '--no-reload-on-change', $script:childExe, '--flag', 'x')
+        $r.Text | Should -Match '--no-reload-on-change -- .+FakeMcp\S* --flag x$'
+    }
+
+    It "fails clearly for an unknown --from server or a missing child" {
+        $r = Invoke-Add @('myserver', '--from', 'nosuch', $script:childExe)
+        $r.Code | Should -Not -Be 0
+        $r.Text | Should -Match "no server named 'nosuch'"
+        $r = Invoke-Add @('myserver', (Join-Path $TestDrive 'missing.exe'))
+        $r.Code | Should -Not -Be 0
+        $r.Text | Should -Match 'child executable not found'
+    }
+}
+
 Describe "sitter_child_stderr" {
     BeforeAll {
         $script:p = Start-Sitter

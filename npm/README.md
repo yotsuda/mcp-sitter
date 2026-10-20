@@ -9,14 +9,19 @@ reconnecting by hand (Claude Code, Claude Desktop, Cursor, Cline, etc).
   <img src="https://github.com/user-attachments/assets/9ae83915-2a07-4d09-a614-cbae4443a792" alt="social-image" width="640" />
 </div>
 
-Install `mcp-sitter` (`npm install -g mcp-sitter`), then point Claude Code
-at it:
+Install `mcp-sitter` (`npm install -g mcp-sitter`), then register your
+server with Claude Code:
 
 ```powershell
-claude mcp add --scope user my-baby-dev `
-    mcp-sitter `
-    C:\path\to\my-baby-mcp.exe [args...]
+mcp-sitter add my-baby C:\path\to\my-baby-mcp.exe [args...]
 ```
+
+This runs `claude mcp add` for a server named **`my-baby-dev`** — `-dev` is
+appended so the dev build never collides with a production registration —
+with your exe behind `mcp-sitter`. `--from my-baby` copies the environment
+variables of the production registration; `--dry-run` prints the `claude`
+command instead of running it. Claude Code loads a new server when it
+starts, so start a new session (or resume this one with `claude --continue`).
 
 That's the entire setup. Your tools are now available as `mcp__my-baby-dev__*`.
 Rebuild your server any time — the next tool call runs on the new build. No
@@ -262,6 +267,24 @@ mcp-sitter [options] [--] <child-exe> [child-args...]
 | `--reload-on <path>` | A file or directory whose change means a new build (repeatable). Default: the child executable, plus `<name>.dll` beside it. Use it for a script server, e.g. `--reload-on dist`. |
 | `--no-reload-on-change` | Restart the child only after `sitter_kill` or a crash. |
 | `--help`, `-h` | Show help. |
+
+```
+mcp-sitter add <name> [options] [--] <child-exe> [child-args...]
+```
+
+Registers `<name>-dev` with Claude Code through `claude mcp add` (`-dev` is
+appended when missing). A child given as a path is made absolute.
+
+| Option | Description |
+| ------ | ----------- |
+| `--scope`, `-s <scope>` | `user` (default), `local` or `project`. |
+| `--from <server>` | Copy the env of an existing registration (user scope, this project's local scope, or `.mcp.json`). |
+| `-e`, `--env KEY=VALUE` | Set an environment variable (repeatable; overrides `--from`). |
+| `--cwd`, `--reload-on`, `--no-reload-on-change` | Passed to `mcp-sitter` in the registration. |
+| `--dry-run` | Print the `claude` command instead of running it. |
+
+A server added while Claude Code runs is not loaded into the running
+session, not even from `/mcp`; start a new session or `claude --continue`.
 
 Use `--` to separate `mcp-sitter` options from the child command if any
 child argument happens to start with `--`.
