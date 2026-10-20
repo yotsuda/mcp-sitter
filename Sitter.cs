@@ -662,8 +662,17 @@ public sealed class Sitter
         catch { }
         var code = SafeExitCode(child);
         Log.Info($"child (gen {gen}) exited; code {code}");
-        if (Volatile.Read(ref _childGeneration) == gen)
+
+        // Under the lifecycle gate, so a respawn cannot slip in between the
+        // generation check and the updates: an old generation's exit that
+        // passed the check and then saw the new child's state would mark
+        // the new child down, call its deliberate stop "external", and fail
+        // its requests (seen on Linux right after a reload).
+        await _lifecycleGate.WaitAsync();
+        try
         {
+            if (Volatile.Read(ref _childGeneration) != gen) return;
+
             _previousExitCode = int.TryParse(code, out var ec) ? ec : null;
             _previousLifetime = _spawnStartedUtc.HasValue
                 ? DateTime.UtcNow - _spawnStartedUtc.Value
@@ -692,6 +701,7 @@ public sealed class Sitter
                     $"child MCP server exited (code {code}) before responding. It restarts on the next tool call; " +
                     "call sitter_child_stderr for its output");
         }
+        finally { _lifecycleGate.Release(); }
     }
 
     static string SafeExitCode(Process p)
@@ -719,7 +729,15 @@ public sealed class Sitter
                     if (!child.WaitForExit(300))
                     {
                         try { child.Kill(entireProcessTree: true); } catch { }
+                        try { child.WaitForExit(2000); } catch { }
                     }
+                }
+                // Recorded here: the exit watcher may only get the gate after
+                // the next child has started, and then leaves the state alone.
+                if (child.HasExited)
+                {
+                    _previousExitCode = int.TryParse(SafeExitCode(child), out var exitCode) ? exitCode : null;
+                    _previousLifetime = _spawnStartedUtc.HasValue ? DateTime.UtcNow - _spawnStartedUtc.Value : null;
                 }
             }
             catch { }

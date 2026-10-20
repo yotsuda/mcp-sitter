@@ -33,6 +33,7 @@ All notable changes to mcp-sitter are documented here. Format based on [Keep a C
 
 - **A request the child died on no longer hangs.** Client requests forwarded to the child are tracked; when the child exits or is stopped before answering, each gets an error response at once (a `tools/list` is answered from the cache), instead of waiting for the client's timeout. An answer written just before the exit is still delivered, and a late answer to a request already failed is dropped rather than sent twice.
 - A request that cannot be delivered to the child is answered with an error instead of being dropped silently.
+- **Race after a restart:** an old child's exit, handled just as the new child started, could mark the new child as down, call the deliberate stop "external", and fail the new child's requests (seen on Linux CI right after a reload). The exit is now handled under the same lock as a spawn, and a deliberate stop records the exit itself.
 
 ## [0.2.0] - 2026-04-21
 
