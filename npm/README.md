@@ -410,6 +410,7 @@ runs no server of its own. Its tools:
 | `sitter_attach` | `name`, `command`, optional `args`, `cwd`, `env`, `reload_on`, `shadow_copy` (default true), `remember` (default true). Starts the server behind its own `mcp-sitter` child, initializes it with the client's own `initialize` params, and announces its tools with `notifications/tools/list_changed`. The result lists the exposed names, a ready-made ToolSearch `select:` query to load them (Claude Code shows new tools as deferred), and **the server's own instructions**, which a client would otherwise show the model only at connect time. Attaching a name again replaces it. |
 | `sitter_detach` | Stops a server, removes its tools and forgets it for the project (`forget: false` keeps it remembered). |
 | `sitter_list` | Attached servers, their commands, which exposed name maps to which tool, what is remembered, and how each remembered server's attach at start went. |
+| `sitter_call` | `name`, `tool`, `arguments`: calls an attached server's tool through the hub. For clients that do not pick up `tools/list_changed` — a Claude Code sub-agent's tool list does not change after it starts. Same result, reloads and notes included. |
 
 Why a hub: Claude Code does not load a server added while it runs (not even
 from `/mcp`), but it does re-read the tool list of a server it already has

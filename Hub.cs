@@ -26,6 +26,7 @@ public sealed class Hub
     public const string Attach = "sitter_attach";
     public const string Detach = "sitter_detach";
     public const string List = "sitter_list";
+    public const string Call = "sitter_call";
 
     readonly HubConfig _config;
     readonly Channel<string> _toClient = Channel.CreateUnbounded<string>();
@@ -181,7 +182,7 @@ public sealed class Hub
         var name = request["params"]?["name"]?.GetValue<string>() ?? "";
         var args = request["params"]?["arguments"] as JsonObject ?? new JsonObject();
 
-        if (name is Attach or Detach or List)
+        if (name is Attach or Detach or List or Call)
         {
             // Off the reader: an attach waits for a server to start, and the
             // calls to other servers should not queue behind it.
@@ -194,11 +195,19 @@ public sealed class Hub
                     {
                         Attach => await AttachAsync(args),
                         Detach => await DetachAsync(args),
+                        Call => await CallAsync(args),
                         _ => ListResult(),
                     };
                 }
                 catch (Exception ex) { result = ErrorResult(ex.Message); }
-                await RespondAsync(id, result);
+                // Never leave the client waiting: if the result cannot be
+                // sent as it is, send the reason instead.
+                try { await RespondAsync(id, result); }
+                catch (Exception ex)
+                {
+                    Log.Error($"{name}: could not send the result: {ex}");
+                    await RespondAsync(id, ErrorResult($"{name} failed to build its response: {ex.Message}"));
+                }
             });
             return;
         }
@@ -349,10 +358,11 @@ public sealed class Hub
 
         var hubPrefix = $"mcp__{_config.HubName}__";
         var sb = new StringBuilder();
-        sb.Append($"Attached '{name}' (pid {child.Pid}): {exposed.Count} tools, callable now as {hubPrefix}<tool>:\n");
+        sb.Append($"Attached '{name}' (pid {child.Pid}): {exposed.Count} tools, exposed as {hubPrefix}<tool>:\n");
         foreach (var r in exposed) sb.Append($"  {r.Exposed}  ->  {r.Tool}\n");
         sb.Append("Claude Code lists them as deferred tools; load them all at once with ToolSearch query \"select:")
-          .Append(string.Join(",", exposed.Select(r => hubPrefix + r.Exposed))).Append("\".\n");
+          .Append(string.Join(",", exposed.Select(r => hubPrefix + r.Exposed))).Append("\".\n")
+          .Append($"If that finds nothing (a sub-agent's tool list does not change after it starts), call them with sitter_call(name: \"{name}\", tool: \"<tool>\", arguments: {{...}}) — same results.\n");
         if (Sitter.IsInterpreter(command))
             sb.Append(args["reload_on"] is JsonArray { Count: > 0 }
                 ? "Rebuild or edit it as usual; the next call after a change in reload_on runs the new version."
@@ -464,6 +474,38 @@ public sealed class Hub
         return TextResult($"Detached '{child.Name}'." + (forget ? (wasRemembered ? " Forgot it for this project." : "") : " Still remembered for this project."));
     }
 
+    // Calls an attached server's tool through this hub tool. For a client
+    // that does not pick up the tools announced with tools/list_changed — a
+    // Claude Code sub-agent's tool list stays as it was when it started — so
+    // the hub is usable there too. The call goes to the server's mcp-sitter
+    // as a normal tools/call, so reloads and restart notices apply as usual.
+    async Task<JsonObject> CallAsync(JsonObject args)
+    {
+        var name = args["name"]?.GetValue<string>();
+        var tool = args["tool"]?.GetValue<string>();
+        HubChild? child = null;
+        if (name != null) lock (_lock) _children.TryGetValue(name, out child);
+        if (child == null) return ErrorResult($"no attached server named '{name}'. Attached: {AttachedNames()}");
+        if (string.IsNullOrEmpty(tool)) return ErrorResult($"tool is required: one of {string.Join(", ", child.ToolNames())}");
+
+        // Accept the server's own tool name or the exposed one.
+        if (!child.ToolNames().Contains(tool))
+        {
+            (HubChild Child, string Tool) route;
+            bool found;
+            lock (_lock) found = _routes.TryGetValue(tool, out route) && ReferenceEquals(route.Child, child);
+            if (!found) return ErrorResult($"'{name}' has no tool '{tool}'. Its tools: {string.Join(", ", child.ToolNames())}");
+            tool = route.Tool;
+        }
+
+        var response = await child.CallToolAsync(tool, args["arguments"]?.DeepClone() ?? new JsonObject());
+        if (response["error"] is JsonNode error)
+            return ErrorResult(error["message"]?.GetValue<string>() ?? error.ToJsonString());
+        // A copy: the node still belongs to the parsed response, and a node
+        // cannot be put into a second parent.
+        return response["result"]?.DeepClone() as JsonObject ?? ErrorResult("the server returned no result");
+    }
+
     JsonObject ListResult()
     {
         List<HubChild> children;
@@ -566,7 +608,7 @@ public sealed class Hub
         (JsonNode?)new JsonObject
         {
             ["name"] = Attach,
-            ["description"] = "Start an MCP server you are developing and make its tools callable in this conversation, with no client restart. They are exposed as <name>_<tool> (a tool already named <name>_... keeps its name). The result lists them, gives a ToolSearch \"select:...\" query to load them (Claude Code shows new tools as deferred: run that query before calling them), and includes the server's own instructions — read those. Afterwards just edit and rebuild the server; its next call runs the new build. Attaching an existing name again replaces it (use that to change args or env). Remembered for this project unless remember=false.",
+            ["description"] = "Start an MCP server you are developing and make its tools callable in this conversation, with no client restart. They are exposed as <name>_<tool> (a tool already named <name>_... keeps its name). The result lists them, gives a ToolSearch \"select:...\" query to load them (Claude Code shows new tools as deferred: run that query before calling them; if it finds nothing, as in a sub-agent, use sitter_call instead), and includes the server's own instructions — read those. Afterwards just edit and rebuild the server; its next call runs the new build. Attaching an existing name again replaces it (use that to change args or env). Remembered for this project unless remember=false.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -576,7 +618,7 @@ public sealed class Hub
                     ["command"] = new JsonObject { ["type"] = "string", ["description"] = "Absolute path to the server's built executable (e.g. ...\\bin\\Debug\\net9.0\\MyServer.exe), or an interpreter such as node, python, uv or dotnet with the script or project in args. A relative path is resolved against cwd." },
                     ["args"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Arguments, e.g. [\"C:\\\\proj\\\\dist\\\\index.js\"] for node." },
                     ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "Working directory for the server (default: the client's directory)." },
-                    ["env"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = new JsonObject { ["type"] = "string" }, ["description"] = "Environment variables for the server. Stored with the remembered attachment." },
+                    ["env"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = new JsonObject { ["type"] = "string" }, ["description"] = "Environment variables for the server process (and its runtime host), e.g. {\"DOTNET_ROLL_FORWARD\": \"Major\"} to run a .NET server on a newer runtime. Stored with the remembered attachment." },
                     ["reload_on"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Only for a server run by an interpreter: the build output or source directories whose change means a new version, e.g. [\"dist\"]. Without it such a server is never reloaded. Not needed for an executable: its whole directory is watched." },
                     ["shadow_copy"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Run an executable from a copy of its directory, so builds can overwrite the original while it runs. Set false only for a server that reads files relative to its own location outside its directory; then, on Windows, call <name>_sitter_kill before each build." },
                     ["remember"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Attach it again automatically when a new session starts in this project." },
@@ -611,6 +653,23 @@ public sealed class Hub
                 ["properties"] = new JsonObject(),
                 ["additionalProperties"] = false,
             },
+        },
+        (JsonNode?)new JsonObject
+        {
+            ["name"] = Call,
+            ["description"] = "Call a tool of an attached server through the hub. Use it when the server's exposed tools cannot be loaded — ToolSearch finds no match, or calling one says \"No such tool\". That happens in a Claude Code sub-agent, whose tool list does not change after it starts. Same result as the direct call, including reloads on a new build and [mcp-sitter] notes.",
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["name"] = new JsonObject { ["type"] = "string", ["description"] = "The attached server's name." },
+                    ["tool"] = new JsonObject { ["type"] = "string", ["description"] = "The tool: the server's own name for it (e.g. fake_echo) or the exposed one; sitter_status, sitter_kill, sitter_binary_info and sitter_child_stderr work too." },
+                    ["arguments"] = new JsonObject { ["type"] = "object", ["description"] = "The tool's arguments." },
+                },
+                ["required"] = new JsonArray("name", "tool"),
+                ["additionalProperties"] = false,
+            },
         });
 
     // The hub's manual: what a model reads at connect time, so it must cover
@@ -621,7 +680,9 @@ public sealed class Hub
         "(absolute path), or an interpreter (node, python, uv, dotnet) with the script in args.\n" +
         "2. Load: its tools become <name>_<tool> (a tool already named <name>_... keeps its name). Claude Code lists " +
         "them as deferred tools: run the ToolSearch \"select:...\" query from the sitter_attach result before calling " +
-        "them. Read the server instructions in that result too.\n" +
+        "them. If ToolSearch finds nothing or a call says \"No such tool\" (a sub-agent's tool list never changes), " +
+        "call them with sitter_call(name, tool, arguments) instead — same results. Read the server instructions in " +
+        "the sitter_attach result too.\n" +
         "3. Develop: edit and rebuild the server as usual; nothing needs stopping. The next call to any of its tools " +
         "restarts it on the new build, and that response starts with \"[mcp-sitter] server restarted (binary changed, " +
         "...)\", listing tools added or removed (load added ones with ToolSearch). Its in-memory state is lost on every " +
@@ -765,6 +826,11 @@ public sealed class HubChild
     {
         lock (_stderr) return string.Join("\n", _stderr.TakeLast(40));
     }
+
+    // A tool call made by the hub itself (sitter_call). No short timeout: a
+    // tool may legitimately run for minutes, and a crash answers at once.
+    public Task<JsonObject> CallToolAsync(string tool, JsonNode arguments) =>
+        RequestAsync("tools/call", new JsonObject { ["name"] = tool, ["arguments"] = arguments }, TimeSpan.FromHours(1));
 
     public async Task<bool> ForwardClientRequestAsync(JsonObject request)
     {

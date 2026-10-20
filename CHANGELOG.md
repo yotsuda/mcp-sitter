@@ -6,6 +6,8 @@ All notable changes to mcp-sitter are documented here. Format based on [Keep a C
 
 ### Added
 
+- **`sitter_call(name, tool, arguments)`** in the hub: calls an attached server's tool through a hub tool. Found by a blind test: a Claude Code sub-agent's tool list does not change after it starts, so a sub-agent could attach a server but never call its tools. The attach result and the hub's instructions point to it when ToolSearch finds nothing, and no longer say the tools are "callable now".
+
 - **Self-explaining tools.** The hub's instructions are now a step-by-step guide (attach → load with ToolSearch → rebuild → debug) covering every quirk: deferred tools, reload at the next call, lost in-memory state, "still being written" notes, `reload_on` for interpreters, shadow copy, per-project memory, and that the hub itself needs `/mcp` → Reconnect. Every tool description says when to use the tool. A registered server (`mcp-sitter add`) gets a short usage note appended to its own instructions; `sitter_attach` warns when an interpreter-run server has no `reload_on`.
 
 - **`--shadow-copy`, on by default in the hub.** The child runs from a copy of its directory (one generation per spawn, under the per-user data folder; old generations and those of exited sitters are pruned), so the build output is never locked and a plain in-place build works on Windows. The whole directory is watched, and a reload waits for a quiet second in it.

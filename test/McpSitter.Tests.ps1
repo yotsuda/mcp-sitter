@@ -404,6 +404,7 @@ Describe "hub" {
         $names | Should -Contain 'sitter_attach'
         $names | Should -Contain 'sitter_detach'
         $names | Should -Contain 'sitter_list'
+        $names | Should -Contain 'sitter_call'
         $names | Where-Object { $_ -like 'fake_*' } | Should -BeNullOrEmpty
     }
 
@@ -427,6 +428,17 @@ Describe "hub" {
     It "routes a prefixed call to the server under its own name" {
         $r = Call-Tool $script:h ($script:nextId++) 'fake_echo' @{ text = 'via hub' }
         $r.result.content[-1].text | Should -Be 'echo: via hub'
+    }
+
+    It "calls an attached server's tool through sitter_call, for clients whose tool list does not refresh" {
+        $r = Call-Tool $script:h ($script:nextId++) 'sitter_call' @{ name = 'fake'; tool = 'fake_echo'; arguments = @{ text = 'via call' } }
+        $r.result.content[-1].text | Should -Be 'echo: via call'
+        # the exposed name works too, and so do the server's sitter_* tools
+        $r = Call-Tool $script:h ($script:nextId++) 'sitter_call' @{ name = 'fake'; tool = 'fake_sitter_status' }
+        ($r.result.content[-1].text | ConvertFrom-Json).childReady | Should -BeTrue
+        $r = Call-Tool $script:h ($script:nextId++) 'sitter_call' @{ name = 'fake'; tool = 'nope' }
+        $r.result.isError | Should -BeTrue
+        $r.result.content[0].text | Should -Match "has no tool 'nope'.*fake_echo"
     }
 
     It "passes a crash through as an error, not a hang" {
