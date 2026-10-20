@@ -1197,8 +1197,11 @@ public sealed class Sitter
                 }
                 if (notices.Count > 0)
                 {
+                    // Each note is its own content item, but a client may show
+                    // the items joined with nothing in between ("...after
+                    // 12.1s.length=5"), so each ends with a newline.
                     for (int n = notices.Count - 1; n >= 0; n--)
-                        contentArr.Insert(0, (JsonNode?)new JsonObject { ["type"] = "text", ["text"] = notices[n] });
+                        contentArr.Insert(0, (JsonNode?)new JsonObject { ["type"] = "text", ["text"] = notices[n] + "\n" });
                     await SendToClientAsync(obj);
                     return;
                 }

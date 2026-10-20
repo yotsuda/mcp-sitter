@@ -358,11 +358,12 @@ public sealed class Hub
 
         var hubPrefix = $"mcp__{_config.HubName}__";
         var sb = new StringBuilder();
-        sb.Append($"Attached '{name}' (pid {child.Pid}): {exposed.Count} tools, exposed as {hubPrefix}<tool>:\n");
+        sb.Append($"Attached '{name}' (pid {child.Pid}): {exposed.Count} tools (exposed name  ->  the server's own name; the client prefixes each with {hubPrefix}):\n");
         foreach (var r in exposed) sb.Append($"  {r.Exposed}  ->  {r.Tool}\n");
-        sb.Append("Claude Code lists them as deferred tools; load them all at once with ToolSearch query \"select:")
-          .Append(string.Join(",", exposed.Select(r => hubPrefix + r.Exposed))).Append("\".\n")
-          .Append($"If that finds nothing (a sub-agent's tool list does not change after it starts), call them with sitter_call(name: \"{name}\", tool: \"<tool>\", arguments: {{...}}) — same results.\n");
+        sb.Append("In a Claude Code sub-agent, skip the next step: its tool list never changes after it starts, so call them with ")
+          .Append($"sitter_call(name: \"{name}\", tool: \"<either name>\", arguments: {{...}}) — same results.\n")
+          .Append("Otherwise Claude Code lists them as deferred tools; load them all at once with ToolSearch query \"select:")
+          .Append(string.Join(",", exposed.Select(r => hubPrefix + r.Exposed))).Append("\" (if it finds nothing, use sitter_call).\n");
         if (Sitter.IsInterpreter(command))
             sb.Append(args["reload_on"] is JsonArray { Count: > 0 }
                 ? "Rebuild or edit it as usual; the next call after a change in reload_on runs the new version."
@@ -618,7 +619,7 @@ public sealed class Hub
                     ["command"] = new JsonObject { ["type"] = "string", ["description"] = "Absolute path to the server's built executable (e.g. ...\\bin\\Debug\\net9.0\\MyServer.exe), or an interpreter such as node, python, uv or dotnet with the script or project in args. A relative path is resolved against cwd." },
                     ["args"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Arguments, e.g. [\"C:\\\\proj\\\\dist\\\\index.js\"] for node." },
                     ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "Working directory for the server (default: the client's directory)." },
-                    ["env"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = new JsonObject { ["type"] = "string" }, ["description"] = "Environment variables for the server process (and its runtime host), e.g. {\"DOTNET_ROLL_FORWARD\": \"Major\"} to run a .NET server on a newer runtime. Stored with the remembered attachment." },
+                    ["env"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = new JsonObject { ["type"] = "string" }, ["description"] = "Environment variables added to (or overriding) the hub's own environment for the server process and its runtime host, e.g. {\"DOTNET_ROLL_FORWARD\": \"Major\"} to run a .NET server on a newer runtime. Stored with the remembered attachment." },
                     ["reload_on"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Only for a server run by an interpreter: the build output or source directories whose change means a new version, e.g. [\"dist\"]. Without it such a server is never reloaded. Not needed for an executable: its whole directory is watched." },
                     ["shadow_copy"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Run an executable from a copy of its directory, so builds can overwrite the original while it runs. Set false only for a server that reads files relative to its own location outside its directory; then, on Windows, call <name>_sitter_kill before each build." },
                     ["remember"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Attach it again automatically when a new session starts in this project." },
@@ -630,7 +631,7 @@ public sealed class Hub
         (JsonNode?)new JsonObject
         {
             ["name"] = Detach,
-            ["description"] = "Stop an attached server and remove its tools. It is also forgotten for this project (not attached again next session) unless forget=false.",
+            ["description"] = "Stop an attached server and remove its tools. It is also forgotten for this project (not attached again next session) unless forget=false; one attached with remember=false has nothing to forget.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -680,9 +681,9 @@ public sealed class Hub
         "(absolute path), or an interpreter (node, python, uv, dotnet) with the script in args.\n" +
         "2. Load: its tools become <name>_<tool> (a tool already named <name>_... keeps its name). Claude Code lists " +
         "them as deferred tools: run the ToolSearch \"select:...\" query from the sitter_attach result before calling " +
-        "them. If ToolSearch finds nothing or a call says \"No such tool\" (a sub-agent's tool list never changes), " +
-        "call them with sitter_call(name, tool, arguments) instead — same results. Read the server instructions in " +
-        "the sitter_attach result too.\n" +
+        "them. In a Claude Code sub-agent (its tool list never changes after it starts), or whenever ToolSearch finds " +
+        "nothing or a call says \"No such tool\", call them with sitter_call(name, tool, arguments) instead — same " +
+        "results. Read the server instructions in the sitter_attach result too.\n" +
         "3. Develop: edit and rebuild the server as usual; nothing needs stopping. The next call to any of its tools " +
         "restarts it on the new build, and that response starts with \"[mcp-sitter] server restarted (binary changed, " +
         "...)\", listing tools added or removed (load added ones with ToolSearch). Its in-memory state is lost on every " +

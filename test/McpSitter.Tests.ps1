@@ -151,8 +151,9 @@ Describe "mcp-sitter core" {
         $r = Call-Tool $script:p ($script:nextId++) 'fake_echo' @{ text = 'after kill' } 15
         $texts = @($r.result.content | ForEach-Object { $_.text })
         $texts | Should -Contain 'echo: after kill'
-        ($texts | Where-Object { $_ -match '\[mcp-sitter\] server restarted' }) |
-            Should -Not -BeNullOrEmpty -Because 'restart notice must be injected into the first post-respawn tool/call response'
+        $notice = $texts | Where-Object { $_ -match '\[mcp-sitter\] server restarted' }
+        $notice | Should -Not -BeNullOrEmpty -Because 'restart notice must be injected into the first post-respawn tool/call response'
+        $notice | Should -Match "\n$" -Because 'a client may join content items with nothing in between'
     }
 
     It "adds how to work with mcp-sitter to the server's own instructions" {
