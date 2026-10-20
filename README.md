@@ -533,7 +533,7 @@ so the AI's tool roster stays stable.
   `resources/*` or `prompts/*` pass through transparently but the bridge
   does not issue a `notifications/resources/list_changed` after respawn on
   its own (yet).
-- **Platform coverage.** v0.2.0 ships `win32-x64`, `linux-x64`, and
+- **Platform coverage.** Ships `win32-x64`, `linux-x64`, and
   `darwin-arm64` (Apple Silicon) native binaries. Intel Mac is not
   shipped — the `macos-13` GHA runner pool is too contended to
   practically build against. The Windows binary is Authenticode-signed
