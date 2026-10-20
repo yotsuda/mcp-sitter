@@ -212,12 +212,21 @@ jobs:
       # reference these exact versions; if meta published first and a
       # subpackage publish later failed, users installing the meta
       # would see missing optional deps and degraded UX.
+      # A version already on npm is skipped, so a release whose publish
+      # failed part-way can be tagged again.
       - name: Publish subpackages with provenance
         shell: bash
         run: |
           set -euo pipefail
+          version='${{ github.ref_name }}'
+          version="${version#v}"
           for plat in win32-x64 linux-x64 darwin-arm64; do
-            echo "=== publishing @ytsuda/mcp-sitter-${plat} ==="
+            pkg="@ytsuda/mcp-sitter-${plat}"
+            if npm view "${pkg}@${version}" version --prefer-online >/dev/null 2>&1; then
+              echo "=== ${pkg}@${version} is already published, skipped ==="
+              continue
+            fi
+            echo "=== publishing ${pkg} ==="
             (cd "npm/platforms/${plat}" && npm publish --access public --provenance)
           done
 
@@ -225,6 +234,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          version='${{ github.ref_name }}'
+          version="${version#v}"
+          if npm view "mcp-sitter@${version}" version --prefer-online >/dev/null 2>&1; then
+            echo "mcp-sitter@${version} is already published, skipped"
+            exit 0
+          fi
           cd npm
           npm publish --access public --provenance
 
