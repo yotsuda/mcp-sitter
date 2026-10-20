@@ -636,7 +636,8 @@ public sealed class Hub
         "with reload_on, e.g. [\"dist\"]. Only tools pass through, not the server's prompts or resources. Attachments " +
         "are remembered for this project and attached again when the next session starts; sitter_detach forgets one, " +
         "sitter_list shows everything. Rebuilding mcp-sitter itself does not update this hub: the user has to run " +
-        "/mcp, pick {hub}, and Reconnect (remembered servers come back by themselves).";
+        "/mcp, pick {hub}, and Reconnect (remembered servers come back by themselves). To make a server a regular " +
+        "registration instead, the user runs `mcp-sitter add <name> <exe>` (registers <name>-dev; needs a client restart).";
 
     static JsonObject TextResult(string text) => new()
     {
