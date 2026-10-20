@@ -6,6 +6,8 @@ All notable changes to mcp-sitter are documented here. Format based on [Keep a C
 
 ### Added
 
+- **Self-explaining tools.** The hub's instructions are now a step-by-step guide (attach → load with ToolSearch → rebuild → debug) covering every quirk: deferred tools, reload at the next call, lost in-memory state, "still being written" notes, `reload_on` for interpreters, shadow copy, per-project memory, and that the hub itself needs `/mcp` → Reconnect. Every tool description says when to use the tool. A registered server (`mcp-sitter add`) gets a short usage note appended to its own instructions; `sitter_attach` warns when an interpreter-run server has no `reload_on`.
+
 - **`--shadow-copy`, on by default in the hub.** The child runs from a copy of its directory (one generation per spawn, under the per-user data folder; old generations and those of exited sitters are pruned), so the build output is never locked and a plain in-place build works on Windows. The whole directory is watched, and a reload waits for a quiet second in it.
 - **Hub remembers attachments per project.** `sitter_attach` stores its arguments (env included) in the per-user data folder, keyed by the client's directory; the next session's hub names them in its instructions and attaches them again at start. `remember: false` and `sitter_detach` (`forget`, default true) opt out; `sitter_list` shows what is remembered and how each start-up attach went.
 - **Notes when a new build could not be used yet.** If a new build is still being written or calls are in flight, the call runs on the previous build and its response starts with a `[mcp-sitter]` line saying so.

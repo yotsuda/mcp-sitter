@@ -548,7 +548,7 @@ public sealed class Sitter
         "java", "ruby", "php", "perl",
     };
 
-    static bool IsInterpreter(string command) =>
+    internal static bool IsInterpreter(string command) =>
         Interpreters.Contains(Path.GetFileNameWithoutExtension(command));
 
     int InFlightCount() { lock (_inFlightLock) return _inFlight.Count; }
@@ -1153,6 +1153,17 @@ public sealed class Sitter
                 if (_spawnStartedUtc.HasValue)
                     _lastStartupDuration = DateTime.UtcNow - _spawnStartedUtc.Value;
                 Log.Info("child initialized (client-driven)");
+            }
+
+            // The client's initialize: add how to work with a server under
+            // mcp-sitter to the server's own instructions.
+            if (idJson == _cachedClientInitializeIdJson && !_config.HubChild && obj["result"] is JsonObject initResult)
+            {
+                var own = initResult["instructions"]?.GetValue<string>();
+                var note = SitterTools.UsageNote(_config.ShadowCopy);
+                initResult["instructions"] = string.IsNullOrWhiteSpace(own) ? note : own + "\n\n" + note;
+                await SendToClientAsync(obj);
+                return;
             }
 
             bool merge;

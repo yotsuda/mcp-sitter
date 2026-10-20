@@ -2,6 +2,9 @@ using System.Text.Json.Nodes;
 
 namespace McpSitter;
 
+// The tools mcp-sitter adds next to the server's own. Their descriptions are
+// the only manual an AI gets, so each says when to use the tool, not just
+// what it returns.
 public static class SitterTools
 {
     public const string Status = "sitter_status";
@@ -13,7 +16,7 @@ public static class SitterTools
         (JsonNode?)new JsonObject
         {
             ["name"] = Status,
-            ["description"] = "Show mcp-sitter status: child MCP server state, child binary path, kill/spawn counts, last startup duration, and previous exit info.",
+            ["description"] = "Show the state of the MCP server under development that mcp-sitter runs: running or down, pid, how many times it restarted and why, the previous exit code (non-zero = it crashed), last startup time, the last tools diff, whether a newer build is on disk than the one running (binaryChangedSinceSpawn), and whether it runs from a shadow copy. Use it when a call behaves unexpectedly or to confirm which build is running.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -24,7 +27,7 @@ public static class SitterTools
         (JsonNode?)new JsonObject
         {
             ["name"] = Kill,
-            ["description"] = "Stop the child MCP server so its binary is unlocked for a rebuild; the next tool call starts it again. Not needed when the build can replace the running binary (it renames the old file aside first, or the OS allows it): mcp-sitter then restarts the child on the new build by itself at the next tool call. Other processes running the same executable are listed, not stopped, unless others=true.",
+            ["description"] = "Stop the MCP server under development now; the next call to one of its tools starts it again, on the newest build. Rarely needed: a rebuild is picked up by itself at the next call. Use it (1) on Windows before a build that overwrites the server's executable in place while it runs WITHOUT a shadow copy (sitter_status shows shadowCopy: null) — otherwise the build fails on the locked file; or (2) to reset the server's in-memory state. Other processes running the same executable may belong to other sessions: they are listed, and stopped only with others=true.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -43,7 +46,7 @@ public static class SitterTools
         (JsonNode?)new JsonObject
         {
             ["name"] = BinaryInfo,
-            ["description"] = "Show version, build date (mtime), size, and other metadata of the child binary. Use this to confirm which build is currently loaded and to detect stale binaries.",
+            ["description"] = "Show the server executable's version, build time (file mtime), size and metadata. Use it to check that the build on disk is the one you just made.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -54,7 +57,7 @@ public static class SitterTools
         (JsonNode?)new JsonObject
         {
             ["name"] = ChildStderr,
-            ["description"] = "Tail the child MCP server's stderr (bounded ring buffer of ~1000 lines, persisted across child respawns). Use after `sitter_status` reports a non-zero `previousExitCode` or `child failed to start`, to retrieve the crash stack trace / error output from the child.",
+            ["description"] = "Read the MCP server's stderr: crash stack traces, startup errors, its own log lines. Use it right after a call fails with \"exited ... before responding\" or the server fails to start. Kept across restarts (~1000 lines, a '----- child respawn -----' line between runs); since_spawn=true shows only the current run.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -72,11 +75,25 @@ public static class SitterTools
                     {
                         ["type"] = "boolean",
                         ["default"] = false,
-                        ["description"] = "If true, only lines from the current child generation — most useful immediately after a crash/respawn.",
+                        ["description"] = "Only lines from the current run of the server (after its last restart).",
                     },
                 },
                 ["additionalProperties"] = false,
             },
         }
     );
+
+    // Appended to the server's own instructions when mcp-sitter runs it as a
+    // registered server, so the client's model learns how to work with it
+    // without the README. (Under the hub, the hub's instructions cover this.)
+    public static string UsageNote(bool shadowCopy) =>
+        "[mcp-sitter] This server runs behind mcp-sitter for development. Edit and rebuild it at any time: the next " +
+        "call to one of its tools restarts it on the new build, and that response starts with \"[mcp-sitter] server " +
+        "restarted (binary changed, ...)\", listing tools added or removed (its in-memory state is lost on a restart). " +
+        "If a response says the new build is still being written, call again once the build has finished. A crash " +
+        "fails the pending call at once and the next call restarts the server; sitter_child_stderr shows its stderr " +
+        "and sitter_status its state. " +
+        (shadowCopy
+            ? "It runs from a shadow copy, so a build can overwrite its output in place while it runs."
+            : "On Windows its executable is locked while it runs: call sitter_kill before a build that overwrites it in place.");
 }

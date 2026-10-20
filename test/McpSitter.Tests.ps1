@@ -155,6 +155,17 @@ Describe "mcp-sitter core" {
             Should -Not -BeNullOrEmpty -Because 'restart notice must be injected into the first post-respawn tool/call response'
     }
 
+    It "adds how to work with mcp-sitter to the server's own instructions" {
+        $p = Start-Sitter
+        try {
+            Send-Msg $p @{ jsonrpc='2.0'; id=1; method='initialize'; params=@{ protocolVersion='2024-11-05'; clientInfo=@{ name='pester'; version='0' }; capabilities=@{} } }
+            $text = (Recv-Until-Id $p 1).result.instructions
+            $text | Should -Match '^\[mcp-sitter\] This server runs behind mcp-sitter'
+            $text | Should -Match 'call sitter_kill before a build'
+        }
+        finally { Stop-Sitter $p }
+    }
+
     It "reflects the respawn in sitter_status" {
         $r = Call-Tool $script:p ($script:nextId++) 'sitter_status' @{}
         $status = $r.result.content[0].text | ConvertFrom-Json
@@ -406,6 +417,8 @@ Describe "hub" {
         $lines[-1].result.isError | Should -Not -BeTrue
         $text | Should -Match 'fake_echo\s+->\s+fake_echo'
         $text | Should -Match 'Always say please\.'
+        # the hub's own guide covers usage; a child's note would only repeat it
+        $text | Should -Not -Match 'runs behind mcp-sitter'
         $names = Get-ToolNames $script:h ($script:nextId++)
         $names | Should -Contain 'fake_echo'
         $names | Should -Contain 'fake_sitter_status'
@@ -510,6 +523,8 @@ Describe "hub" {
             Send-Msg $h2 @{ jsonrpc='2.0'; id=1; method='initialize'; params=@{ protocolVersion='2024-11-05'; clientInfo=@{ name='pester'; version='0' }; capabilities=@{} } }
             $init = Recv-Until-Id $h2 1
             $init.result.instructions | Should -Match 'Remembered for this project.*fake'
+            $init.result.instructions | Should -Match '(?s)1\. Attach.*2\. Load.*ToolSearch.*3\. Develop.*4\. Debug'
+            $init.result.instructions | Should -Match 'pick sitter-dev, and Reconnect'
             $init.result.instructions | Should -Not -Match '\bother\b'
             Send-Msg $h2 @{ jsonrpc='2.0'; method='notifications/initialized' }
             $deadline = (Get-Date).AddSeconds(20); $names = @()
@@ -526,7 +541,7 @@ Describe "hub" {
         $h3 = Start-Hub
         try {
             Send-Msg $h3 @{ jsonrpc='2.0'; id=1; method='initialize'; params=@{ protocolVersion='2024-11-05'; clientInfo=@{ name='pester'; version='0' }; capabilities=@{} } }
-            (Recv-Until-Id $h3 1).result.instructions | Should -Not -Match 'Remembered for this project'
+            (Recv-Until-Id $h3 1).result.instructions | Should -Not -Match 'being attached now'
         }
         finally { Stop-Sitter $h3 }
     }

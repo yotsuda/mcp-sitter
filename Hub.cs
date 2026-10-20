@@ -138,7 +138,7 @@ public sealed class Hub
             case "initialize":
                 _clientInitializeParams = obj["params"]?.DeepClone();
                 var remembered = LoadMemory();
-                var instructions = Instructions;
+                var instructions = Instructions.Replace("{hub}", _config.HubName);
                 if (remembered.Count > 0)
                     instructions += "\n\nRemembered for this project and being attached now (tools arrive with " +
                         "notifications/tools/list_changed): " +
@@ -296,7 +296,7 @@ public sealed class Hub
         var shadowCopy = args["shadow_copy"]?.GetValue<bool>() ?? true;
         var remember = args["remember"]?.GetValue<bool>() ?? true;
 
-        var sitterArgs = new List<string>();
+        var sitterArgs = new List<string> { "--hub-child" };
         if (cwd != null) { sitterArgs.Add("--cwd"); sitterArgs.Add(cwd); }
         if (shadowCopy) sitterArgs.Add("--shadow-copy");
         if (args["reload_on"] is JsonArray reloadOn)
@@ -353,9 +353,14 @@ public sealed class Hub
         foreach (var r in exposed) sb.Append($"  {r.Exposed}  ->  {r.Tool}\n");
         sb.Append("Claude Code lists them as deferred tools; load them all at once with ToolSearch query \"select:")
           .Append(string.Join(",", exposed.Select(r => hubPrefix + r.Exposed))).Append("\".\n");
-        sb.Append(shadowCopy
-            ? "It runs from a shadow copy of its directory, so the build output is not locked: just rebuild, and the next call runs the new build."
-            : $"It runs in place: on Windows its binary is locked, so call {name}_sitter_kill before a build that writes it in place.");
+        if (Sitter.IsInterpreter(command))
+            sb.Append(args["reload_on"] is JsonArray { Count: > 0 }
+                ? "Rebuild or edit it as usual; the next call after a change in reload_on runs the new version."
+                : "WARNING: it runs under an interpreter and no reload_on was given, so changes are never picked up. Attach it again with reload_on, e.g. [\"dist\"] (its build output) or its source directory.");
+        else
+            sb.Append(shadowCopy
+                ? "It runs from a shadow copy of its directory, so the build output is not locked: just rebuild, and the next call runs the new build."
+                : $"It runs in place: on Windows its binary is locked, so call {name}_sitter_kill before a build that writes it in place.");
         sb.Append(remember
             ? " Remembered for this project: the hub attaches it again in the next session (sitter_detach forgets it)."
             : " Not remembered (remember=false).");
@@ -561,20 +566,20 @@ public sealed class Hub
         (JsonNode?)new JsonObject
         {
             ["name"] = Attach,
-            ["description"] = "Attach an MCP server under development to this hub. It starts behind its own mcp-sitter, and its tools become callable in this same conversation as <name>_<tool> (no client restart). Each rebuild of it is picked up at its next call. Attaching an existing name replaces it. The result lists the tools and the server's own instructions.",
+            ["description"] = "Start an MCP server you are developing and make its tools callable in this conversation, with no client restart. They are exposed as <name>_<tool> (a tool already named <name>_... keeps its name). The result lists them, gives a ToolSearch \"select:...\" query to load them (Claude Code shows new tools as deferred: run that query before calling them), and includes the server's own instructions — read those. Afterwards just edit and rebuild the server; its next call runs the new build. Attaching an existing name again replaces it (use that to change args or env). Remembered for this project unless remember=false.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
-                    ["name"] = new JsonObject { ["type"] = "string", ["description"] = "Short name; prefixes its tools (<name>_<tool>). Letters, digits and '-'." },
-                    ["command"] = new JsonObject { ["type"] = "string", ["description"] = "The server executable (full path), or an interpreter such as node." },
-                    ["args"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Arguments for the command." },
-                    ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "Working directory for the server." },
-                    ["env"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = new JsonObject { ["type"] = "string" }, ["description"] = "Environment variables for the server." },
-                    ["reload_on"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Files or directories whose change means a new build. Default: the executable's directory (with shadow_copy) or the executable and <name>.dll beside it. Needed for an interpreter, e.g. [\"dist\"]." },
-                    ["shadow_copy"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Run the server from a copy of its directory, so the build output is never locked and any build can overwrite it. Turn off for a server that finds files relative to its own location outside that directory." },
-                    ["remember"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Attach it again automatically in the next session for this project (stored, env included, in the per-user data folder)." },
+                    ["name"] = new JsonObject { ["type"] = "string", ["description"] = "Short name, e.g. the project name; prefixes its tools. Letters, digits and '-'." },
+                    ["command"] = new JsonObject { ["type"] = "string", ["description"] = "Absolute path to the server's built executable (e.g. ...\\bin\\Debug\\net9.0\\MyServer.exe), or an interpreter such as node, python, uv or dotnet with the script or project in args. A relative path is resolved against cwd." },
+                    ["args"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Arguments, e.g. [\"C:\\\\proj\\\\dist\\\\index.js\"] for node." },
+                    ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "Working directory for the server (default: the client's directory)." },
+                    ["env"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = new JsonObject { ["type"] = "string" }, ["description"] = "Environment variables for the server. Stored with the remembered attachment." },
+                    ["reload_on"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Only for a server run by an interpreter: the build output or source directories whose change means a new version, e.g. [\"dist\"]. Without it such a server is never reloaded. Not needed for an executable: its whole directory is watched." },
+                    ["shadow_copy"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Run an executable from a copy of its directory, so builds can overwrite the original while it runs. Set false only for a server that reads files relative to its own location outside its directory; then, on Windows, call <name>_sitter_kill before each build." },
+                    ["remember"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Attach it again automatically when a new session starts in this project." },
                 },
                 ["required"] = new JsonArray("name", "command"),
                 ["additionalProperties"] = false,
@@ -583,7 +588,7 @@ public sealed class Hub
         (JsonNode?)new JsonObject
         {
             ["name"] = Detach,
-            ["description"] = "Stop an attached server, remove its tools, and forget it for this project.",
+            ["description"] = "Stop an attached server and remove its tools. It is also forgotten for this project (not attached again next session) unless forget=false.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -599,7 +604,7 @@ public sealed class Hub
         (JsonNode?)new JsonObject
         {
             ["name"] = List,
-            ["description"] = "List the attached servers, their commands, and which exposed tool name maps to which of their tools.",
+            ["description"] = "Show what is attached: each server's command and pid, every exposed tool name with the server tool it maps to, what is remembered for this project, and how each remembered server's automatic attach went at session start (with the error if it failed).",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -608,13 +613,30 @@ public sealed class Hub
             },
         });
 
+    // The hub's manual: what a model reads at connect time, so it must cover
+    // every quirk without the README.
     const string Instructions =
-        "mcp-sitter hub: attach an MCP server you are developing with sitter_attach(name, command, args). Its tools then " +
-        "appear here as <name>_<tool> in this same conversation, without restarting the client, and every rebuild of it " +
-        "is picked up at its next call. Each attached server also has <name>_sitter_status, <name>_sitter_kill, " +
-        "<name>_sitter_binary_info and <name>_sitter_child_stderr. A server runs from a shadow copy by default, so " +
-        "rebuilding it in place just works. Attachments are remembered per project and attached again in the next " +
-        "session; sitter_detach forgets one.";
+        "mcp-sitter hub: run MCP servers you are developing inside this conversation, with no client restart.\n" +
+        "1. Attach: sitter_attach(name, command, args?, cwd?, env?). command is the server's built executable " +
+        "(absolute path), or an interpreter (node, python, uv, dotnet) with the script in args.\n" +
+        "2. Load: its tools become <name>_<tool> (a tool already named <name>_... keeps its name). Claude Code lists " +
+        "them as deferred tools: run the ToolSearch \"select:...\" query from the sitter_attach result before calling " +
+        "them. Read the server instructions in that result too.\n" +
+        "3. Develop: edit and rebuild the server as usual; nothing needs stopping. The next call to any of its tools " +
+        "restarts it on the new build, and that response starts with \"[mcp-sitter] server restarted (binary changed, " +
+        "...)\", listing tools added or removed (load added ones with ToolSearch). Its in-memory state is lost on every " +
+        "restart. A response that says the new build is still being written ran on the previous build: call again " +
+        "once the build has finished.\n" +
+        "4. Debug: a crash fails the pending call at once and the next call restarts the server. " +
+        "<name>_sitter_child_stderr shows its stderr (stack traces, startup errors); <name>_sitter_status shows its " +
+        "state and which build runs.\n" +
+        "Good to know: an executable runs from a shadow copy, so the build may overwrite its output in place (set " +
+        "shadow_copy=false only for a server that reads files outside its own directory relative to its location, and " +
+        "then call <name>_sitter_kill before each build on Windows). A server run by an interpreter is reloaded only " +
+        "with reload_on, e.g. [\"dist\"]. Only tools pass through, not the server's prompts or resources. Attachments " +
+        "are remembered for this project and attached again when the next session starts; sitter_detach forgets one, " +
+        "sitter_list shows everything. Rebuilding mcp-sitter itself does not update this hub: the user has to run " +
+        "/mcp, pick {hub}, and Reconnect (remembered servers come back by themselves).";
 
     static JsonObject TextResult(string text) => new()
     {
