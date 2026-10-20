@@ -18,6 +18,20 @@ public static class Program
         if (args[0] == "add")
             return AddCommand.Run(args[1..]);
 
+        if (args[0] == "--hub")
+        {
+            // --hub-name: the name the hub is registered under, which counts
+            // toward the 64-character tool name limit.
+            var hubName = "sitter-dev";
+            if (args.Length >= 3 && args[1] == "--hub-name") hubName = args[2];
+            else if (args.Length != 1) { Console.Error.WriteLine("mcp-sitter: --hub takes only --hub-name <name>"); return 1; }
+            using var hubCts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; hubCts.Cancel(); };
+            try { await new Hub(new HubConfig(hubName)).RunAsync(hubCts.Token); return 0; }
+            catch (OperationCanceledException) { return 0; }
+            catch (Exception ex) { Log.Error($"fatal: {ex}"); return 2; }
+        }
+
         var config = SitterConfig.Parse(args);
         if (config is null)
         {
@@ -53,6 +67,10 @@ Usage:
   mcp-sitter add <name> [options] [--] <child-exe> [child-args...]
                            Register <name>-dev with Claude Code
                            (mcp-sitter add --help for details)
+  mcp-sitter --hub [--hub-name <name>]
+                           Hub: attach servers while the client runs
+                           (sitter_attach); register with
+                           mcp-sitter add --hub
 
 Options:
   --cwd <path>             Working directory for the child

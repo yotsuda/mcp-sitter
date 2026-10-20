@@ -6,6 +6,8 @@ All notable changes to mcp-sitter are documented here. Format based on [Keep a C
 
 ### Added
 
+- **Hub (`mcp-sitter --hub`, registered with `mcp-sitter add --hub` as `sitter-dev`).** Attach servers under development while the client runs: `sitter_attach(name, command, args, cwd, env, reload_on)` starts the server behind its own mcp-sitter child and announces its tools with `notifications/tools/list_changed`, so they are callable as `<name>_<tool>` in the same conversation — Claude Code does not load a newly added server until it restarts, but it re-reads a registered server's tool list at once. The attach result carries the server's own instructions. `sitter_detach` and `sitter_list` manage attachments; names past the 64-character tool name limit are cut with a stable hash; requests from a server to the client get ids unique across servers. Only tools are merged (no prompts/resources), and attachments last until the client exits.
+
 - **`mcp-sitter add <name> <child-exe> [args...]`.** Registers `<name>-dev` with Claude Code (via `claude mcp add`), running the child behind this mcp-sitter. `-dev` is appended when missing, a child path is made absolute, `--from <server>` copies the env of an existing registration (`-e` overrides), sitter options (`--cwd`, `--reload-on`, `--no-reload-on-change`) are passed through, and `--dry-run` prints the command. A server added mid-session is not loaded until Claude Code starts again (`claude --continue` keeps the conversation); after that, rebuilds reload by themselves.
 
 - **Reload on change.** Before each `tools/call` / `tools/list`, mcp-sitter checks whether a new build has replaced the child's binary (size + last-write time of the exe and `<name>.dll` beside it). When it has, and the new files are completely written, it restarts its own child on them — no `sitter_kill` needed when the build can replace a running binary (on Windows: rename the old file aside, then copy the new one in). Nothing is watched in the background and nothing is stopped while a build writes, unlike the file watcher removed before 0.2.0. The restart notice says `binary changed`.
@@ -14,6 +16,7 @@ All notable changes to mcp-sitter are documented here. Format based on [Keep a C
 
 ### Changed
 
+- **`Build.ps1` no longer stops every running `mcp-sitter.exe`.** That killed the mcp-sitter of every open MCP session on the machine. A running copy of `dist/mcp-sitter.exe` or the npm sub-package binary is now renamed aside and replaced. `Build.ps1 -ReadmeOnly` regenerates `npm/README.md`, which now keeps non-architecture diagrams as links instead of repeating the architecture sketch.
 - **`sitter_kill` stops only its own child by default.** Other processes running the same executable are listed in the report (`sameExeStillRunning`) instead of killed: they may be other sessions' servers, and a client that loses its server may never start it again. `others: true` restores the old behavior — never for an interpreter such as `node` or `python`, where it would kill unrelated programs, possibly the MCP client itself.
 - README: the value is stated as what it is — the agent runs edit → build → call the new build in one conversation — rather than as avoiding a client restart.
 

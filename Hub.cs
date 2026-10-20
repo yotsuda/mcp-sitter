@@ -1,0 +1,741 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading.Channels;
+using System.Text.Json.Nodes;
+
+namespace McpSitter;
+
+// Hub mode (`mcp-sitter --hub`): one registration that MCP servers under
+// development are attached to while the client runs.
+//
+// A server added to Claude Code mid-session is not loaded until the client
+// starts again, but a registered server whose tool list changes is re-read
+// at once. So the hub is registered once, and sitter_attach starts a server
+// behind it and announces the new tools with notifications/tools/list_changed:
+// they are callable in the same conversation, with no restart.
+//
+// Each attached server runs behind its own mcp-sitter child process. That
+// child already does everything per server — reload on a new build, errors
+// for requests the server died on, the stderr ring, restart notices — so the
+// hub only merges the tool lists under a per-server prefix and routes calls.
+// The hub is the MCP client of each child; it forwards the client's own
+// initialize params so the server sees the real client.
+public sealed class Hub
+{
+    public const string Attach = "sitter_attach";
+    public const string Detach = "sitter_detach";
+    public const string List = "sitter_list";
+
+    readonly HubConfig _config;
+    readonly Channel<string> _toClient = Channel.CreateUnbounded<string>();
+    readonly object _lock = new();
+    readonly Dictionary<string, HubChild> _children = new(StringComparer.OrdinalIgnoreCase);
+    // exposed tool name -> (child, the tool's own name)
+    readonly Dictionary<string, (HubChild Child, string Tool)> _routes = new(StringComparer.Ordinal);
+    // client request id -> child serving it (for notifications/cancelled)
+    readonly Dictionary<string, HubChild> _clientRequests = new();
+    // id the hub gave a child's request to the client -> (child, the child's id)
+    readonly Dictionary<string, (HubChild Child, JsonNode Id)> _childRequests = new();
+    long _nextId;
+    JsonNode? _clientInitializeParams;
+
+    public Hub(HubConfig config) { _config = config; }
+
+    public async Task RunAsync(CancellationToken ct)
+    {
+        Log.Info("mcp-sitter hub starting");
+        var writer = Task.Run(() => ClientWriterLoop(ct), ct);
+        var reader = Task.Run(() => ClientReaderLoop(ct), ct);
+        await Task.WhenAny(reader, writer);
+        List<HubChild> children;
+        lock (_lock) children = _children.Values.ToList();
+        foreach (var c in children) c.Stop();
+        _toClient.Writer.TryComplete();
+        try { await Task.WhenAll(reader, writer); } catch { }
+        Log.Info("hub shutdown complete");
+    }
+
+    // =================================================================
+    // client stdio
+    // =================================================================
+
+    async Task ClientReaderLoop(CancellationToken ct)
+    {
+        using var reader = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
+        while (!ct.IsCancellationRequested)
+        {
+            string? line;
+            try { line = await reader.ReadLineAsync(ct); }
+            catch { break; }
+            if (line == null) { Log.Info("client stdin closed"); break; }
+            if (line.Length == 0) continue;
+            try { await HandleClientLineAsync(line); }
+            catch (Exception ex) { Log.Error($"handle client: {ex}"); }
+        }
+    }
+
+    async Task ClientWriterLoop(CancellationToken ct)
+    {
+        var stdout = Console.OpenStandardOutput();
+        try
+        {
+            await foreach (var line in _toClient.Reader.ReadAllAsync(ct))
+            {
+                var bytes = Encoding.UTF8.GetBytes(line + "\n");
+                await stdout.WriteAsync(bytes, ct);
+                await stdout.FlushAsync(ct);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Log.Warn($"client write: {ex.Message}"); }
+    }
+
+    internal Task SendToClientAsync(JsonObject obj) => _toClient.Writer.WriteAsync(obj.ToJsonString()).AsTask();
+
+    Task RespondAsync(JsonNode? id, JsonObject result) => SendToClientAsync(new JsonObject
+    {
+        ["jsonrpc"] = "2.0",
+        ["id"] = id?.DeepClone(),
+        ["result"] = result,
+    });
+
+    internal Task RespondErrorAsync(JsonNode? id, int code, string message) => SendToClientAsync(new JsonObject
+    {
+        ["jsonrpc"] = "2.0",
+        ["id"] = id?.DeepClone(),
+        ["error"] = new JsonObject { ["code"] = code, ["message"] = message },
+    });
+
+    Task NotifyToolsChangedAsync() => SendToClientAsync(new JsonObject
+    {
+        ["jsonrpc"] = "2.0",
+        ["method"] = "notifications/tools/list_changed",
+    });
+
+    async Task HandleClientLineAsync(string line)
+    {
+        if (JsonNode.Parse(line) is not JsonObject obj) return;
+        var method = obj["method"]?.GetValue<string>();
+        var id = obj["id"];
+
+        if (method == null)
+        {
+            // the client's answer to a request a child sent it
+            if (id == null) return;
+            (HubChild Child, JsonNode Id) target;
+            lock (_lock)
+            {
+                if (!_childRequests.Remove(id.ToJsonString(), out target)) return;
+            }
+            obj["id"] = target.Id.DeepClone();
+            await target.Child.SendAsync(obj);
+            return;
+        }
+
+        switch (method)
+        {
+            case "initialize":
+                _clientInitializeParams = obj["params"]?.DeepClone();
+                await RespondAsync(id, new JsonObject
+                {
+                    ["protocolVersion"] = obj["params"]?["protocolVersion"]?.DeepClone() ?? "2025-06-18",
+                    ["capabilities"] = new JsonObject { ["tools"] = new JsonObject { ["listChanged"] = true } },
+                    ["serverInfo"] = new JsonObject { ["name"] = "mcp-sitter-hub", ["version"] = Version() },
+                    ["instructions"] = Instructions,
+                });
+                return;
+            case "notifications/initialized":
+                return;
+            case "ping":
+                await RespondAsync(id, new JsonObject());
+                return;
+            case "tools/list":
+                await RespondAsync(id, new JsonObject { ["tools"] = BuildToolList() });
+                return;
+            case "tools/call":
+                await HandleToolCallAsync(obj);
+                return;
+            case "notifications/cancelled":
+                var requestId = obj["params"]?["requestId"]?.ToJsonString();
+                HubChild? owner = null;
+                if (requestId != null) lock (_lock) _clientRequests.Remove(requestId, out owner);
+                if (owner != null) await owner.SendAsync(obj);
+                return;
+        }
+
+        if (id != null) await RespondErrorAsync(id, -32601, $"method not found: {method}");
+    }
+
+    async Task HandleToolCallAsync(JsonObject request)
+    {
+        var id = request["id"];
+        var name = request["params"]?["name"]?.GetValue<string>() ?? "";
+        var args = request["params"]?["arguments"] as JsonObject ?? new JsonObject();
+
+        if (name is Attach or Detach or List)
+        {
+            // Off the reader: an attach waits for a server to start, and the
+            // calls to other servers should not queue behind it.
+            _ = Task.Run(async () =>
+            {
+                JsonObject result;
+                try
+                {
+                    result = name switch
+                    {
+                        Attach => await AttachAsync(args),
+                        Detach => await DetachAsync(args),
+                        _ => ListResult(),
+                    };
+                }
+                catch (Exception ex) { result = ErrorResult(ex.Message); }
+                await RespondAsync(id, result);
+            });
+            return;
+        }
+
+        (HubChild Child, string Tool) route;
+        bool found;
+        lock (_lock) found = _routes.TryGetValue(name, out route);
+        if (!found)
+        {
+            await RespondErrorAsync(id, -32602, $"unknown tool {name}. Attached servers: {AttachedNames()}. Call {List} for their tools.");
+            return;
+        }
+
+        var forwarded = (JsonObject)request.DeepClone();
+        forwarded["params"]!["name"] = route.Tool;
+        if (id != null) lock (_lock) _clientRequests[id.ToJsonString()] = route.Child;
+        if (!await route.Child.ForwardClientRequestAsync(forwarded))
+        {
+            if (id != null) lock (_lock) _clientRequests.Remove(id.ToJsonString());
+            await RespondErrorAsync(id, -32002, $"server '{route.Child.Name}' is not running. Attach it again with {Attach}.");
+        }
+    }
+
+    // =================================================================
+    // children -> client
+    // =================================================================
+
+    internal void ClientRequestDone(JsonNode id)
+    {
+        lock (_lock) _clientRequests.Remove(id.ToJsonString());
+    }
+
+    // A request from a child to the client (sampling, roots, elicitation)
+    // gets an id unique across children.
+    internal Task ForwardChildRequestAsync(HubChild child, JsonObject request)
+    {
+        var hubId = $"mcp-sitter-hub:{child.Name}:{Interlocked.Increment(ref _nextId)}";
+        lock (_lock) _childRequests[JsonValue.Create(hubId).ToJsonString()] = (child, request["id"]!.DeepClone());
+        request["id"] = hubId;
+        return SendToClientAsync(request);
+    }
+
+    internal async Task ChildToolsChangedAsync(HubChild child)
+    {
+        try
+        {
+            await child.RefreshToolsAsync();
+            Remap();
+            await NotifyToolsChangedAsync();
+        }
+        catch (Exception ex) { Log.Warn($"{child.Name}: tools refresh failed: {ex.Message}"); }
+    }
+
+    internal async Task ChildExitedAsync(HubChild child)
+    {
+        bool current;
+        lock (_lock)
+        {
+            current = _children.TryGetValue(child.Name, out var c) && ReferenceEquals(c, child);
+            if (current) _children.Remove(child.Name);
+            foreach (var key in _clientRequests.Where(kv => ReferenceEquals(kv.Value, child)).Select(kv => kv.Key).ToList())
+                _clientRequests.Remove(key);
+        }
+        if (!current) return;
+        Log.Warn($"{child.Name}: mcp-sitter child exited");
+        Remap();
+        await NotifyToolsChangedAsync();
+    }
+
+    // =================================================================
+    // hub tools
+    // =================================================================
+
+    async Task<JsonObject> AttachAsync(JsonObject args)
+    {
+        var name = args["name"]?.GetValue<string>()?.Trim();
+        var command = args["command"]?.GetValue<string>();
+        if (string.IsNullOrEmpty(name) || !name.All(c => char.IsAsciiLetterOrDigit(c) || c == '-'))
+            return ErrorResult("name must be letters, digits and '-' (it prefixes every tool: <name>_<tool>)");
+        if (string.IsNullOrEmpty(command))
+            return ErrorResult("command is required: the server executable (or an interpreter such as node, with args)");
+        if (_clientInitializeParams == null)
+            return ErrorResult("the client has not initialized yet");
+
+        var cwd = args["cwd"]?.GetValue<string>();
+        if (cwd != null && !Directory.Exists(cwd)) return ErrorResult($"cwd not found: {cwd}");
+        if ((command.Contains('/') || command.Contains('\\')) && !File.Exists(Path.GetFullPath(command, cwd ?? Environment.CurrentDirectory)))
+            return ErrorResult($"command not found: {command}");
+
+        var sitterArgs = new List<string>();
+        if (cwd != null) { sitterArgs.Add("--cwd"); sitterArgs.Add(Path.GetFullPath(cwd)); }
+        if (args["reload_on"] is JsonArray reloadOn)
+            foreach (var p in reloadOn)
+                if (p?.GetValue<string>() is string path) { sitterArgs.Add("--reload-on"); sitterArgs.Add(path); }
+        sitterArgs.Add("--");
+        sitterArgs.Add(command);
+        if (args["args"] is JsonArray childArgs)
+            foreach (var a in childArgs)
+                if (a != null) sitterArgs.Add(a.ToString());
+
+        var env = new Dictionary<string, string>();
+        if (args["env"] is JsonObject envObj)
+            foreach (var (k, v) in envObj)
+                if (v != null) env[k] = v.ToString();
+
+        // Attaching a name again replaces it (e.g. a different command).
+        HubChild? old;
+        lock (_lock) _children.Remove(name, out old);
+        old?.Stop();
+
+        var child = new HubChild(this, name, sitterArgs, env);
+        string? instructions;
+        try
+        {
+            instructions = await child.StartAsync(_clientInitializeParams);
+        }
+        catch (Exception ex)
+        {
+            child.Stop();
+            Remap();
+            if (old != null) await NotifyToolsChangedAsync();
+            var stderr = child.StderrTail();
+            return ErrorResult($"'{name}' failed to start: {ex.Message}" + (stderr.Length > 0 ? $"\n--- stderr ---\n{stderr}" : ""));
+        }
+
+        lock (_lock) _children[name] = child;
+        var exposed = Remap().Where(r => ReferenceEquals(r.Child, child)).ToList();
+        await NotifyToolsChangedAsync();
+
+        var sb = new StringBuilder();
+        sb.Append($"Attached '{name}' (pid {child.Pid}): {exposed.Count} tools, callable now as mcp__{_config.HubName}__<tool>:\n");
+        foreach (var r in exposed) sb.Append($"  {r.Exposed}  ->  {r.Tool}\n");
+        sb.Append("Each rebuild is picked up at the next call (see the README's reload rules: on Windows, deploy by renaming the old binary aside, or call ")
+          .Append(name).Append("_sitter_kill before the build).");
+        if (!string.IsNullOrWhiteSpace(instructions))
+            sb.Append($"\n\nThe server's own instructions (an MCP client shows these to the model at connect time; read them now):\n{instructions}");
+        return TextResult(sb.ToString());
+    }
+
+    async Task<JsonObject> DetachAsync(JsonObject args)
+    {
+        var name = args["name"]?.GetValue<string>();
+        HubChild? child = null;
+        if (name != null) lock (_lock) _children.Remove(name, out child);
+        if (child == null) return ErrorResult($"no attached server named '{name}'. Attached: {AttachedNames()}");
+        child.Stop();
+        Remap();
+        await NotifyToolsChangedAsync();
+        return TextResult($"Detached '{child.Name}'.");
+    }
+
+    JsonObject ListResult()
+    {
+        List<HubChild> children;
+        lock (_lock) children = _children.Values.ToList();
+        var routes = Remap();
+        var arr = new JsonArray();
+        foreach (var c in children)
+        {
+            var tools = new JsonObject();
+            foreach (var r in routes.Where(r => ReferenceEquals(r.Child, c))) tools[r.Exposed] = r.Tool;
+            arr.Add((JsonNode?)new JsonObject
+            {
+                ["name"] = c.Name,
+                ["command"] = c.Command,
+                ["sitterPid"] = c.Pid,
+                ["tools"] = tools,
+            });
+        }
+        return TextResult(new JsonObject { ["attached"] = arr }.ToJsonString(new() { WriteIndented = true }));
+    }
+
+    string AttachedNames()
+    {
+        lock (_lock) return _children.Count == 0 ? "(none)" : string.Join(", ", _children.Keys);
+    }
+
+    // =================================================================
+    // tool naming
+    // =================================================================
+
+    // Rebuilds the exposed-name routes from every child's current tools.
+    // Claude Code names a tool mcp__<server>__<tool> and the API caps a tool
+    // name at 64 characters, so <name>_<tool> gets what is left after the
+    // hub's own prefix; a longer one is cut and given a short hash of its
+    // full name, so it stays unique and stable across reloads.
+    List<(string Exposed, HubChild Child, string Tool)> Remap()
+    {
+        var budget = Math.Max(16, 64 - "mcp__".Length - _config.HubName.Length - "__".Length);
+        var result = new List<(string, HubChild, string)>();
+        lock (_lock)
+        {
+            _routes.Clear();
+            foreach (var child in _children.Values.OrderBy(c => c.Name, StringComparer.Ordinal))
+            {
+                foreach (var tool in child.ToolNames())
+                {
+                    var exposed = $"{child.Name}_{tool}";
+                    if (exposed.Length > budget)
+                    {
+                        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(exposed)))[..6].ToLowerInvariant();
+                        exposed = exposed[..(budget - 7)] + "_" + hash;
+                    }
+                    _routes[exposed] = (child, tool);
+                    result.Add((exposed, child, tool));
+                }
+            }
+        }
+        return result;
+    }
+
+    JsonArray BuildToolList()
+    {
+        var tools = HubToolDefinitions();
+        List<(string Exposed, HubChild Child, string Tool)> routes = Remap();
+        foreach (var r in routes)
+        {
+            if (r.Child.ToolDefinition(r.Tool) is not JsonObject def) continue;
+            def["name"] = r.Exposed;
+            var desc = def["description"]?.GetValue<string>();
+            def["description"] = $"[{r.Child.Name}] {desc}";
+            tools.Add((JsonNode?)def);
+        }
+        return tools;
+    }
+
+    static JsonArray HubToolDefinitions() => new(
+        (JsonNode?)new JsonObject
+        {
+            ["name"] = Attach,
+            ["description"] = "Attach an MCP server under development to this hub. It starts behind its own mcp-sitter, and its tools become callable in this same conversation as <name>_<tool> (no client restart). Each rebuild of it is picked up at its next call. Attaching an existing name replaces it. The result lists the tools and the server's own instructions.",
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["name"] = new JsonObject { ["type"] = "string", ["description"] = "Short name; prefixes its tools (<name>_<tool>). Letters, digits and '-'." },
+                    ["command"] = new JsonObject { ["type"] = "string", ["description"] = "The server executable (full path), or an interpreter such as node." },
+                    ["args"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Arguments for the command." },
+                    ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "Working directory for the server." },
+                    ["env"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = new JsonObject { ["type"] = "string" }, ["description"] = "Environment variables for the server." },
+                    ["reload_on"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Files or directories whose change means a new build. Default: the executable (and <name>.dll beside it). Needed for an interpreter, e.g. [\"dist\"]." },
+                },
+                ["required"] = new JsonArray("name", "command"),
+                ["additionalProperties"] = false,
+            },
+        },
+        (JsonNode?)new JsonObject
+        {
+            ["name"] = Detach,
+            ["description"] = "Stop an attached server and remove its tools.",
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject { ["name"] = new JsonObject { ["type"] = "string" } },
+                ["required"] = new JsonArray("name"),
+                ["additionalProperties"] = false,
+            },
+        },
+        (JsonNode?)new JsonObject
+        {
+            ["name"] = List,
+            ["description"] = "List the attached servers, their commands, and which exposed tool name maps to which of their tools.",
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject(),
+                ["additionalProperties"] = false,
+            },
+        });
+
+    const string Instructions =
+        "mcp-sitter hub: attach an MCP server you are developing with sitter_attach(name, command, args). Its tools then " +
+        "appear here as <name>_<tool> in this same conversation, without restarting the client, and every rebuild of it " +
+        "is picked up at its next call. Each attached server also has <name>_sitter_status, <name>_sitter_kill, " +
+        "<name>_sitter_binary_info and <name>_sitter_child_stderr. Attached servers last until the client exits; " +
+        "for a permanent registration use `mcp-sitter add <name> <exe>` (registers <name>-dev).";
+
+    static JsonObject TextResult(string text) => new()
+    {
+        ["content"] = new JsonArray((JsonNode?)new JsonObject { ["type"] = "text", ["text"] = text }),
+    };
+
+    static JsonObject ErrorResult(string text)
+    {
+        var r = TextResult(text);
+        r["isError"] = true;
+        return r;
+    }
+
+    static string Version() =>
+        typeof(Hub).Assembly.GetName().Version?.ToString(3) ?? "0";
+}
+
+public sealed record HubConfig(string HubName);
+
+// One attached server: an mcp-sitter child process the hub talks MCP to.
+public sealed class HubChild
+{
+    readonly Hub _hub;
+    readonly List<string> _sitterArgs;
+    readonly Dictionary<string, string> _env;
+    readonly SemaphoreSlim _stdinLock = new(1, 1);
+    readonly object _lock = new();
+    readonly Dictionary<string, TaskCompletionSource<JsonObject>> _pending = new();
+    readonly HashSet<string> _clientIds = new();
+    readonly Queue<string> _stderr = new();
+    JsonArray _tools = new();
+    Process? _process;
+    long _nextId;
+    volatile bool _stopping;
+
+    public string Name { get; }
+    public string Command => string.Join(" ", _sitterArgs.SkipWhile(a => a != "--").Skip(1));
+    public int? Pid { get { try { return _process?.Id; } catch { return null; } } }
+
+    public HubChild(Hub hub, string name, List<string> sitterArgs, Dictionary<string, string> env)
+    {
+        _hub = hub;
+        Name = name;
+        _sitterArgs = sitterArgs;
+        _env = env;
+    }
+
+    // Starts the mcp-sitter child, initializes it with the client's params,
+    // and reads its tools. Returns the server's instructions, if any.
+    public async Task<string?> StartAsync(JsonNode clientInitializeParams)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = Environment.ProcessPath ?? "mcp-sitter",
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardInputEncoding = new UTF8Encoding(false),
+            StandardOutputEncoding = new UTF8Encoding(false),
+            StandardErrorEncoding = new UTF8Encoding(false),
+        };
+        foreach (var a in _sitterArgs) psi.ArgumentList.Add(a);
+        foreach (var (k, v) in _env) psi.Environment[k] = v;
+
+        _process = Process.Start(psi) ?? throw new InvalidOperationException("could not start mcp-sitter");
+        var process = _process;
+        _ = Task.Run(() => ReaderLoop(process));
+        _ = Task.Run(() => StderrLoop(process));
+        _ = Task.Run(async () =>
+        {
+            try { await process.WaitForExitAsync(); } catch { }
+            FailPending("mcp-sitter child exited");
+            if (!_stopping) await _hub.ChildExitedAsync(this);
+        });
+
+        var init = await RequestAsync("initialize", clientInitializeParams.DeepClone(), TimeSpan.FromSeconds(30));
+        if (init["error"] is JsonNode err) throw new InvalidOperationException($"initialize failed: {err["message"]}");
+        await SendAsync(new JsonObject { ["jsonrpc"] = "2.0", ["method"] = "notifications/initialized" });
+        await RefreshToolsAsync();
+        return init["result"]?["instructions"]?.GetValue<string>();
+    }
+
+    public void Stop()
+    {
+        _stopping = true;
+        var p = _process;
+        if (p == null) return;
+        // Closing stdin shuts mcp-sitter down, and it stops its own child.
+        try { p.StandardInput.Close(); } catch { }
+        try { if (!p.WaitForExit(2000)) p.Kill(entireProcessTree: true); } catch { }
+        FailPending("detached");
+    }
+
+    public async Task RefreshToolsAsync()
+    {
+        var all = new JsonArray();
+        string? cursor = null;
+        do
+        {
+            var p = new JsonObject();
+            if (cursor != null) p["cursor"] = cursor;
+            var resp = await RequestAsync("tools/list", p, TimeSpan.FromSeconds(30));
+            if (resp["result"]?["tools"] is JsonArray tools)
+                foreach (var t in tools) all.Add(t?.DeepClone());
+            cursor = resp["result"]?["nextCursor"]?.GetValue<string>();
+        } while (cursor != null);
+        lock (_lock) _tools = all;
+    }
+
+    public List<string> ToolNames()
+    {
+        lock (_lock)
+            return _tools.Select(t => t?["name"]?.GetValue<string>()).Where(n => n != null).Select(n => n!).ToList();
+    }
+
+    public JsonObject? ToolDefinition(string tool)
+    {
+        lock (_lock)
+            return _tools.FirstOrDefault(t => t?["name"]?.GetValue<string>() == tool)?.DeepClone() as JsonObject;
+    }
+
+    public string StderrTail()
+    {
+        lock (_stderr) return string.Join("\n", _stderr.TakeLast(40));
+    }
+
+    public async Task<bool> ForwardClientRequestAsync(JsonObject request)
+    {
+        var key = request["id"]?.ToJsonString();
+        if (key != null) lock (_lock) _clientIds.Add(key);
+        if (await SendAsync(request)) return true;
+        if (key != null) lock (_lock) _clientIds.Remove(key);
+        return false;
+    }
+
+    public async Task<bool> SendAsync(JsonObject obj)
+    {
+        var p = _process;
+        if (p == null) return false;
+        await _stdinLock.WaitAsync();
+        try
+        {
+            if (p.HasExited) return false;
+            var bytes = Encoding.UTF8.GetBytes(obj.ToJsonString() + "\n");
+            await p.StandardInput.BaseStream.WriteAsync(bytes);
+            await p.StandardInput.BaseStream.FlushAsync();
+            return true;
+        }
+        catch { return false; }
+        finally { _stdinLock.Release(); }
+    }
+
+    async Task<JsonObject> RequestAsync(string method, JsonNode? @params, TimeSpan timeout)
+    {
+        var id = $"mcp-sitter-hub:{Interlocked.Increment(ref _nextId)}";
+        var key = JsonValue.Create(id).ToJsonString();
+        var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_lock) _pending[key] = tcs;
+        var sent = await SendAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["method"] = method, ["params"] = @params });
+        if (!sent)
+        {
+            lock (_lock) _pending.Remove(key);
+            throw new InvalidOperationException($"could not send {method}: mcp-sitter is not running");
+        }
+        try { return await tcs.Task.WaitAsync(timeout); }
+        catch (TimeoutException)
+        {
+            lock (_lock) _pending.Remove(key);
+            throw new InvalidOperationException($"{method} timed out after {timeout.TotalSeconds:0}s");
+        }
+    }
+
+    void FailPending(string reason)
+    {
+        List<TaskCompletionSource<JsonObject>> pending;
+        lock (_lock) { pending = _pending.Values.ToList(); _pending.Clear(); }
+        foreach (var t in pending) t.TrySetException(new InvalidOperationException(reason));
+    }
+
+    async Task ReaderLoop(Process process)
+    {
+        try
+        {
+            string? line;
+            while ((line = await process.StandardOutput.ReadLineAsync()) != null)
+            {
+                if (line.Length == 0) continue;
+                try { await HandleLineAsync(line); }
+                catch (Exception ex) { Log.Warn($"{Name}: {ex.Message}"); }
+            }
+        }
+        catch { }
+        // mcp-sitter answers every request before it exits; anything left
+        // was never going to be answered.
+        List<string> orphaned;
+        lock (_lock) { orphaned = _clientIds.ToList(); _clientIds.Clear(); }
+        foreach (var key in orphaned)
+        {
+            var id = JsonNode.Parse(key);
+            _hub.ClientRequestDone(id!);
+            await _hub.RespondErrorAsync(id, -32002, $"server '{Name}' was detached or its mcp-sitter exited before responding");
+        }
+    }
+
+    async Task StderrLoop(Process process)
+    {
+        try
+        {
+            string? line;
+            while ((line = await process.StandardError.ReadLineAsync()) != null)
+            {
+                lock (_stderr)
+                {
+                    _stderr.Enqueue(line);
+                    while (_stderr.Count > 200) _stderr.Dequeue();
+                }
+                Log.Debug($"[{Name}] {line}");
+            }
+        }
+        catch { }
+    }
+
+    async Task HandleLineAsync(string line)
+    {
+        if (JsonNode.Parse(line) is not JsonObject obj) return;
+        var method = obj["method"]?.GetValue<string>();
+        var id = obj["id"];
+
+        if (method == null && id != null)
+        {
+            var key = id.ToJsonString();
+            TaskCompletionSource<JsonObject>? tcs;
+            bool client;
+            lock (_lock)
+            {
+                _pending.Remove(key, out tcs);
+                client = tcs == null && _clientIds.Remove(key);
+            }
+            if (tcs != null) { tcs.TrySetResult(obj); return; }
+            if (client)
+            {
+                _hub.ClientRequestDone(id);
+                await _hub.SendToClientAsync(obj);
+            }
+            return;
+        }
+
+        if (method == "notifications/tools/list_changed")
+        {
+            _ = Task.Run(() => _hub.ChildToolsChangedAsync(this));
+            return;
+        }
+
+        if (method == "ping" && id != null)
+        {
+            await SendAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(), ["result"] = new JsonObject() });
+            return;
+        }
+
+        if (id != null)
+        {
+            await _hub.ForwardChildRequestAsync(this, obj);
+            return;
+        }
+
+        // other notifications (progress, logging) pass through
+        await _hub.SendToClientAsync(obj);
+    }
+}

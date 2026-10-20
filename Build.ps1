@@ -2,10 +2,14 @@
 .SYNOPSIS
     Release-publish mcp-sitter (NativeAOT) and deploy to npm/platforms/win32-x64/bin.
 .DESCRIPTION
-    Stops any running mcp-sitter.exe, runs `dotnet publish -c Release` (NativeAOT
-    single native exe into ./dist), optionally Authenticode-signs the binary,
-    and mirrors the resulting binary to ./npm/platforms/win32-x64/bin so the
-    Windows platform sub-package ships the fresh build.
+    Runs `dotnet publish -c Release` (NativeAOT single native exe into ./dist),
+    optionally Authenticode-signs the binary, and mirrors the resulting binary
+    to ./npm/platforms/win32-x64/bin so the Windows platform sub-package ships
+    the fresh build. No process is stopped: a running copy of either exe is
+    renamed aside first (Windows allows renaming a running binary), so the
+    mcp-sitter instances of every MCP client session keep running.
+.PARAMETER ReadmeOnly
+    Only regenerate npm/README.md from README.md.
 .PARAMETER Sign
     Authenticode-sign the published binary. Requires -PfxPath and will prompt
     for the PFX password at sign time.
@@ -25,7 +29,8 @@
 param(
     [switch]$Sign,
     [string]$PfxPath = 'C:\MyProj\vault\yotsuda.pfx',
-    [string]$TimestampUrl = 'http://timestamp.digicert.com'
+    [string]$TimestampUrl = 'http://timestamp.digicert.com',
+    [switch]$ReadmeOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,17 +41,54 @@ $ProjectFile = Join-Path $ProjectRoot 'McpSitter.csproj'
 $DistDir = Join-Path $ProjectRoot 'dist'
 $NpmWin32BinDir = Join-Path $ProjectRoot 'npm\platforms\win32-x64\bin'
 
+# Regenerate npm/README.md from root README.md (npmjs.com does not render
+# mermaid fences): the Architecture diagram becomes an ASCII sketch, the
+# lazy-respawn sequence is dropped, and any other diagram becomes a link.
+function Update-NpmReadme {
+    $readmeSrc = Join-Path $ProjectRoot 'README.md'
+    $readmeDst = Join-Path $ProjectRoot 'npm\README.md'
+    if (-not (Test-Path $readmeSrc)) { return }
+    $text = [System.IO.File]::ReadAllText($readmeSrc)
+    $architecture = @"
+``````
+MCP Client <--stdio--> mcp-sitter <--stdio--> your MCP server
+  (spawned and owned by the bridge; restarted on a new build, after
+   sitter_kill, or after a crash)
+``````
+
+See the [GitHub README](https://github.com/yotsuda/mcp-sitter#architecture)
+for rendered architecture and sequence diagrams.
+"@
+    $link = 'See the [GitHub README](https://github.com/yotsuda/mcp-sitter) for the rendered diagram.'
+    $stripped = [regex]::Replace($text, '(?s)### Lazy respawn sequence\r?\n\r?\n```mermaid.*?```\r?\n\r?\n', '')
+    $stripped = [regex]::Replace($stripped, '(?s)(## Architecture\r?\n\r?\n)```mermaid.*?```', { param($m) $m.Groups[1].Value + $architecture })
+    $stripped = [regex]::Replace($stripped, '(?s)```mermaid.*?```', $link)
+    [System.IO.File]::WriteAllText($readmeDst, $stripped)
+    Write-Host "      Regenerated $readmeDst (mermaid stripped)" -ForegroundColor Green
+}
+
+if ($ReadmeOnly) { Update-NpmReadme; return }
+
+# Replaces $Destination even while it runs: the old file is renamed aside
+# first, and the running process keeps the renamed file. Stashes left by
+# earlier runs are removed once nothing holds them.
+function Move-Aside([string]$Destination) {
+    $dir = Split-Path $Destination -Parent
+    $name = Split-Path $Destination -Leaf
+    Get-ChildItem -LiteralPath $dir -Filter "$name.stash-*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $Destination) {
+        $stash = "$Destination.stash-$(Get-Random)"
+        Move-Item -LiteralPath $Destination -Destination $stash -Force
+        Remove-Item -LiteralPath $stash -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host '=== mcp-sitter Release Publish ===' -ForegroundColor Cyan
 
-Write-Host "`n[1/4] Stopping running mcp-sitter.exe processes..." -ForegroundColor Yellow
-$processes = @(Get-Process -Name 'mcp-sitter' -ErrorAction Ignore)
-if ($processes.Count -gt 0) {
-    $processes | Stop-Process -Force
-    Start-Sleep -Milliseconds 500
-    Write-Host "      Stopped $($processes.Count) process(es)." -ForegroundColor Green
-} else {
-    Write-Host '      No running processes found.' -ForegroundColor DarkGray
-}
+Write-Host "`n[1/4] Moving running copies aside (nothing is stopped)..." -ForegroundColor Yellow
+New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+Move-Aside (Join-Path $DistDir 'mcp-sitter.exe')
 
 Write-Host "`n[2/4] Publishing (Release, NativeAOT)..." -ForegroundColor Yellow
 dotnet publish $ProjectFile -c Release -r win-x64 -o $DistDir
@@ -77,32 +119,11 @@ if ($Sign) {
 Write-Host "`n[4/4] Deploying to npm/platforms/win32-x64/bin..." -ForegroundColor Yellow
 $dst = Join-Path $NpmWin32BinDir 'mcp-sitter.exe'
 New-Item -ItemType Directory -Force -Path $NpmWin32BinDir | Out-Null
+Move-Aside $dst
 Copy-Item $src $dst -Force
 $size = [Math]::Round((Get-Item $dst).Length / 1MB, 2)
 Write-Host "      Copied to $dst ($size MB)" -ForegroundColor Green
 
-# Regenerate npm/README.md from root README.md, stripping mermaid blocks
-# (npmjs.com does not render mermaid fences).
-$NpmDir = Join-Path $ProjectRoot 'npm'
-$readmeSrc = Join-Path $ProjectRoot 'README.md'
-$readmeDst = Join-Path $NpmDir 'README.md'
-if (Test-Path $readmeSrc) {
-    $text = [System.IO.File]::ReadAllText($readmeSrc)
-    $replacement = @"
-``````
-MCP Client <--stdio--> mcp-sitter <--stdio--> your MCP server
-  (spawned and owned by the bridge; lazily respawned after kill)
-``````
-
-See the [GitHub README](https://github.com/yotsuda/mcp-sitter#architecture)
-for rendered architecture and sequence diagrams.
-"@
-    # 1. Strip the "### Lazy respawn sequence" subsection entirely (subheader + its mermaid block)
-    $stripped = [regex]::Replace($text, '(?s)### Lazy respawn sequence\r?\n\r?\n```mermaid.*?```\r?\n\r?\n', '')
-    # 2. Replace the remaining mermaid block (under "## Architecture") with ASCII + GitHub link
-    $stripped = [regex]::Replace($stripped, '(?s)```mermaid.*?```', $replacement)
-    [System.IO.File]::WriteAllText($readmeDst, $stripped)
-    Write-Host "      Regenerated $readmeDst (mermaid stripped)" -ForegroundColor Green
-}
+Update-NpmReadme
 
 Write-Host "`n=== Done ===" -ForegroundColor Green

@@ -17,6 +17,7 @@ obj/
 !npm/bin/
 !npm/bin/**
 !npm/platforms/*/bin/
+npm/platforms/*/bin/*
 !npm/platforms/*/bin/.gitkeep
 
 ## npm pack artifacts

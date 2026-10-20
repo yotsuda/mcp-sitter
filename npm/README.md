@@ -29,7 +29,28 @@ client restart, no lost conversation context, and the AI sees a `[mcp-sitter]`
 notice with the tools-diff so it self-corrects after schema changes. (On
 Windows a running binary is locked: call `sitter_kill` before the build, or
 have the build rename the old file aside before copying the new one — see
-[Reload on change](https://github.com/yotsuda/mcp-sitter#reload-on-change).)
+[Reload on change](#reload-on-change).)
+
+### No restart even for a new server: the hub
+
+Registering a server needs that one client restart. To skip it too,
+register the **hub** once:
+
+```powershell
+mcp-sitter add --hub          # registers sitter-dev
+```
+
+From then on the AI attaches any server under development while the session
+runs, and its tools are callable right away:
+
+```
+sitter_attach(name: "my-baby", command: "C:\path\to\my-baby-mcp.exe")
+→ mcp__sitter-dev__my-baby_<tool>, in this same conversation
+```
+
+Each attached server runs behind its own `mcp-sitter`, so it reloads on a
+new build, reports crashes and keeps its stderr exactly like a registered
+one. See [Hub](#hub).
 
 > Other MCP clients (Claude Desktop, Cursor, Cline, ...) work the same way:
 > point the client at `mcp-sitter` and pass your server exe + args.
@@ -177,8 +198,7 @@ diagnose and fix its own server without the developer even noticing:
 3. The AI calls `sitter_child_stderr` and reads the stack trace, then fixes
    and rebuilds.
 
-See the [GitHub README](https://github.com/yotsuda/mcp-sitter#crash-self-diagnosis-flow)
-for the rendered sequence diagram.
+See the [GitHub README](https://github.com/yotsuda/mcp-sitter) for the rendered diagram.
 
 Because the stderr ring survives respawns and the delimiter clearly marks
 the boundary, the AI sees *both* the crashed generation's stack trace *and*
@@ -218,9 +238,9 @@ NativeAOT-publishes for each RID (win-x64 / linux-x64 / osx-arm64),
 Authenticode-signs the Windows binary via Azure Key Vault on a
 Windows runner, and publishes three platform-specific npm
 sub-packages (`@ytsuda/mcp-sitter-win32-x64`, `@ytsuda/mcp-sitter-linux-x64`,
-`@ytsuda/mcp-sitter-darwin-arm64`) plus the umbrella `mcp-sitter`
-package, all with SLSA provenance. The umbrella resolves the
-matching sub-package at runtime via its `optionalDependencies`.
+`@ytsuda/mcp-sitter-darwin-arm64`) plus the umbrella `mcp-sitter` package,
+all with SLSA provenance. The umbrella resolves the matching
+sub-package at runtime via its `optionalDependencies`.
 
 ## Built-in tools
 
@@ -249,7 +269,10 @@ cd mcp-sitter
 .\Build.ps1
 ```
 
-The AOT binary lands at `dist/mcp-sitter.exe`. Each release runs
+The AOT binary lands at `dist/mcp-sitter.exe`; NativeAOT needs the C++
+build tools ("Desktop development with C++" in Visual Studio). `Build.ps1`
+stops nothing: a running copy is renamed aside first, so the `mcp-sitter`
+instances of open MCP sessions keep running. Each release runs
 `dotnet publish` for all three platform RIDs (`win-x64` / `linux-x64` /
 `osx-arm64`) on matrix runners, Authenticode-signs the Windows binary
 via Azure Key Vault, and publishes per-platform npm sub-packages with
@@ -282,6 +305,7 @@ appended when missing). A child given as a path is made absolute.
 | `-e`, `--env KEY=VALUE` | Set an environment variable (repeatable; overrides `--from`). |
 | `--cwd`, `--reload-on`, `--no-reload-on-change` | Passed to `mcp-sitter` in the registration. |
 | `--dry-run` | Print the `claude` command instead of running it. |
+| `--hub` | Register the [hub](#hub) (default name `sitter-dev`) instead of a server. Takes no child command. |
 
 A server added while Claude Code runs is not loaded into the running
 session, not even from `/mcp`; start a new session or `claude --continue`.
@@ -366,6 +390,37 @@ gets an error response right away (a `tools/list` is answered from the
 cache), so the client never waits for its own timeout. An answer the child
 wrote just before exiting is still delivered.
 
+### Hub
+
+`mcp-sitter --hub` (registered with `mcp-sitter add --hub`, as `sitter-dev`)
+runs no server of its own. Its tools:
+
+| Tool | What it does |
+| ---- | ------------ |
+| `sitter_attach` | `name`, `command`, optional `args`, `cwd`, `env`, `reload_on`. Starts the server behind its own `mcp-sitter` child, initializes it with the client's own `initialize` params, and announces its tools with `notifications/tools/list_changed`. The result lists the exposed names and **the server's own instructions**, which a client would otherwise show the model only at connect time. Attaching a name again replaces it. |
+| `sitter_detach` | Stops a server and removes its tools. |
+| `sitter_list` | Attached servers, their commands, and which exposed name maps to which tool. |
+
+Why a hub: Claude Code does not load a server added while it runs (not even
+from `/mcp`), but it does re-read the tool list of a server it already has
+when that server sends `tools/list_changed`. The hub is that server.
+
+- **Tool names** are `<name>_<tool>`, so Claude Code shows
+  `mcp__sitter-dev__<name>_<tool>`. Tool names are capped at 64 characters,
+  so a longer one is cut and ends in a short hash of its full name; it stays
+  the same across reloads, and `sitter_list` shows the mapping. Each server
+  also gets `<name>_sitter_status`, `<name>_sitter_kill`,
+  `<name>_sitter_binary_info` and `<name>_sitter_child_stderr`.
+- **Per-server behavior** — reload on change, errors for requests the server
+  died on, restart notices, the stderr ring — comes from that server's own
+  `mcp-sitter` child, unchanged.
+- **Requests from a server to the client** (sampling, roots, elicitation)
+  pass through with ids that stay unique across servers.
+- **Limits.** Only tools are merged: a server's prompts and resources are
+  not exposed through the hub. Attachments last until the client exits; the
+  AI attaches again in a new session, or you make one permanent with
+  `mcp-sitter add`.
+
 ### During downtime
 
 While the child is down, incoming `tools/call` requests trigger a lazy
@@ -390,12 +445,15 @@ so the AI's tool roster stays stable.
   its own (yet).
 - **Platform coverage.** v0.2.0 ships `win32-x64`, `linux-x64`, and
   `darwin-arm64` (Apple Silicon) native binaries. Intel Mac is not
-  shipped. The Windows binary is Authenticode-signed by the project's
-  code-signing cert via Azure Key Vault; Linux and macOS binaries ship
-  unsigned (all three are covered by npm SLSA provenance).
+  shipped — the `macos-13` GHA runner pool is too contended to
+  practically build against. The Windows binary is Authenticode-signed
+  by the project's code-signing cert via Azure Key Vault; Linux and
+  macOS binaries ship unsigned (neither OS has equivalent mandatory
+  signature verification, and all three platforms are covered by npm
+  SLSA provenance).
 - **One child per bridge instance.** The child command is fixed at bridge
   startup; to supervise multiple MCP servers, register multiple `mcp-sitter`
-  instances with different names.
+  instances with different names, or attach them all to the [hub](#hub).
 - **Restart notice is only injected when the response has a `result.content`
   array** (= tool-level response). JSON-RPC error responses (the `error`
   field at the envelope level) are forwarded unchanged; the notification

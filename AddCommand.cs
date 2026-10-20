@@ -26,6 +26,7 @@ public static class AddCommand
         public readonly List<string> ReloadOn = new();
         public bool NoReload;
         public bool DryRun;
+        public bool Hub;
         public string? Child;
         public string[] ChildArgs = Array.Empty<string>();
     }
@@ -46,13 +47,13 @@ public static class AddCommand
             return 1;
         }
 
-        var name = DevName(o.Name!);
+        var name = DevName(o.Name ?? "sitter");
 
         // The child must be found from wherever the client starts mcp-sitter,
         // so a path is made absolute here; a bare command (node, uv) is left
         // for PATH, as the client would.
-        var child = o.Child!;
-        if (LooksLikePath(child))
+        var child = o.Child ?? "";
+        if (!o.Hub && LooksLikePath(child))
         {
             var full = Path.GetFullPath(child);
             if (!File.Exists(full))
@@ -89,13 +90,22 @@ public static class AddCommand
         }
         claudeArgs.Add("--");
         claudeArgs.Add(sitterPath);
-        if (o.Cwd != null) { claudeArgs.Add("--cwd"); claudeArgs.Add(Path.GetFullPath(o.Cwd)); }
-        var reloadBase = o.Cwd != null ? Path.GetFullPath(o.Cwd) : Environment.CurrentDirectory;
-        foreach (var p in o.ReloadOn) { claudeArgs.Add("--reload-on"); claudeArgs.Add(Path.GetFullPath(p, reloadBase)); }
-        if (o.NoReload) claudeArgs.Add("--no-reload-on-change");
-        claudeArgs.Add("--");
-        claudeArgs.Add(child);
-        claudeArgs.AddRange(o.ChildArgs);
+        if (o.Hub)
+        {
+            claudeArgs.Add("--hub");
+            claudeArgs.Add("--hub-name");
+            claudeArgs.Add(name);
+        }
+        else
+        {
+            if (o.Cwd != null) { claudeArgs.Add("--cwd"); claudeArgs.Add(Path.GetFullPath(o.Cwd)); }
+            var reloadBase = o.Cwd != null ? Path.GetFullPath(o.Cwd) : Environment.CurrentDirectory;
+            foreach (var p in o.ReloadOn) { claudeArgs.Add("--reload-on"); claudeArgs.Add(Path.GetFullPath(p, reloadBase)); }
+            if (o.NoReload) claudeArgs.Add("--no-reload-on-change");
+            claudeArgs.Add("--");
+            claudeArgs.Add(child);
+            claudeArgs.AddRange(o.ChildArgs);
+        }
 
         if (o.DryRun)
         {
@@ -115,8 +125,16 @@ public static class AddCommand
 
         Console.WriteLine();
         Console.WriteLine($"Registered {name}. Claude Code loads new servers when it starts: start a new session, or");
-        Console.WriteLine("resume this one with `claude --continue`. Its tools are then mcp__" + name + "__*, and each");
-        Console.WriteLine("rebuild is picked up at the next tool call.");
+        if (o.Hub)
+        {
+            Console.WriteLine("resume this one with `claude --continue`. From then on, sitter_attach starts a server under");
+            Console.WriteLine($"development and its tools appear as mcp__{name}__<name>_<tool> at once, with no restart.");
+        }
+        else
+        {
+            Console.WriteLine("resume this one with `claude --continue`. Its tools are then mcp__" + name + "__*, and each");
+            Console.WriteLine("rebuild is picked up at the next tool call.");
+        }
         return 0;
     }
 
@@ -159,11 +177,21 @@ public static class AddCommand
                     o.NoReload = true; i++; break;
                 case "--dry-run":
                     o.DryRun = true; i++; break;
+                case "--hub":
+                    o.Hub = true; i++; break;
                 default:
                     error = $"unknown option {a}"; return null;
             }
         }
 
+        if (o.Hub)
+        {
+            // The hub runs no child of its own; servers are attached later.
+            if (i < args.Length) { error = "--hub takes no child command (attach servers with sitter_attach)"; return null; }
+            if (o.From != null || o.Env.Count > 0 || o.Cwd != null || o.ReloadOn.Count > 0 || o.NoReload)
+            { error = "--hub takes only a name, --scope and --dry-run; give the rest to sitter_attach"; return null; }
+            return o;
+        }
         if (o.Name == null) { error = "missing server name"; return null; }
         if (i >= args.Length) { error = "missing child command"; return null; }
         o.Child = args[i];
@@ -276,9 +304,14 @@ public static class AddCommand
         Console.Error.WriteLine(
 @"Usage:
   mcp-sitter add <name> [options] [--] <child-exe> [child-args...]
+  mcp-sitter add --hub [<name>] [--scope <scope>] [--dry-run]
 
 Registers <name>-dev with Claude Code (`claude mcp add`), running
 <child-exe> behind this mcp-sitter. -dev is appended when missing.
+
+With --hub, registers the hub (default name sitter-dev) instead: servers
+are then attached with sitter_attach while Claude Code runs, and their
+tools appear at once, with no restart.
 
 Options:
   --scope, -s <scope>      user (default), local or project

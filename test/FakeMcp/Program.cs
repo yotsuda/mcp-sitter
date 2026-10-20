@@ -41,6 +41,7 @@ public static class Program
                         {
                             ["tools"] = new JsonObject { ["listChanged"] = true },
                         },
+                        ["instructions"] = Environment.GetEnvironmentVariable("FAKEMCP_INSTRUCTIONS"),
                     },
                 },
                 "tools/list" => new JsonObject
