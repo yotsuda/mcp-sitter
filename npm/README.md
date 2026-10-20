@@ -50,7 +50,9 @@ sitter_attach(name: "my-baby", command: "C:\path\to\my-baby-mcp.exe")
 
 Each attached server runs behind its own `mcp-sitter`, so it reloads on a
 new build, reports crashes and keeps its stderr exactly like a registered
-one. See [Hub](#hub).
+one. It runs from a shadow copy, so even a plain in-place `dotnet build`
+works on Windows, and it is remembered for the project and attached again
+in the next session. See [Hub](#hub).
 
 > Other MCP clients (Claude Desktop, Cursor, Cline, ...) work the same way:
 > point the client at `mcp-sitter` and pass your server exe + args.
@@ -289,6 +291,7 @@ mcp-sitter [options] [--] <child-exe> [child-args...]
 | `--cwd <path>` | Working directory for the child process. Defaults to `mcp-sitter`'s cwd. |
 | `--reload-on <path>` | A file or directory whose change means a new build (repeatable). Default: the child executable, plus `<name>.dll` beside it. Use it for a script server, e.g. `--reload-on dist`. |
 | `--no-reload-on-change` | Restart the child only after `sitter_kill` or a crash. |
+| `--shadow-copy` | Run the child from a copy of its directory (under the per-user data folder, one copy per spawn), so the build output is never locked. Watches the whole directory. |
 | `--help`, `-h` | Show help. |
 
 ```
@@ -355,11 +358,18 @@ Nothing runs in the background and nothing is stopped while a build is
 writing, so the build never races `mcp-sitter` over a half-written file.
 
 On Windows a running binary is locked, so a build that writes it in place
-fails while the child runs. Either call `sitter_kill` before the build, or
+fails while the child runs. There are three ways out: run the child from a
+shadow copy (`--shadow-copy`; the hub does this by default), so the build
+output is never locked at all; call `sitter_kill` before the build; or
 deploy the way `mcp-sitter` handles by itself: rename the old file aside,
 then copy the new one in (Windows allows renaming a running binary; the
 running process keeps the renamed file, and the next spawn loads the new
-one). On Linux and macOS a running binary can be replaced by a new file
+one).
+
+When a new build is found but cannot be used yet — still being written, or
+other calls are running on the current one — the call runs on the previous
+build and its response starts with a `[mcp-sitter]` line saying so, so the
+AI never mistakes old behavior for its fix. On Linux and macOS a running binary can be replaced by a new file
 (unlinked or renamed over); a build that rewrites it in place may fail with
 "Text file busy" and then needs `sitter_kill` too.
 
@@ -397,16 +407,25 @@ runs no server of its own. Its tools:
 
 | Tool | What it does |
 | ---- | ------------ |
-| `sitter_attach` | `name`, `command`, optional `args`, `cwd`, `env`, `reload_on`. Starts the server behind its own `mcp-sitter` child, initializes it with the client's own `initialize` params, and announces its tools with `notifications/tools/list_changed`. The result lists the exposed names and **the server's own instructions**, which a client would otherwise show the model only at connect time. Attaching a name again replaces it. |
-| `sitter_detach` | Stops a server and removes its tools. |
-| `sitter_list` | Attached servers, their commands, and which exposed name maps to which tool. |
+| `sitter_attach` | `name`, `command`, optional `args`, `cwd`, `env`, `reload_on`, `shadow_copy` (default true), `remember` (default true). Starts the server behind its own `mcp-sitter` child, initializes it with the client's own `initialize` params, and announces its tools with `notifications/tools/list_changed`. The result lists the exposed names, a ready-made ToolSearch `select:` query to load them (Claude Code shows new tools as deferred), and **the server's own instructions**, which a client would otherwise show the model only at connect time. Attaching a name again replaces it. |
+| `sitter_detach` | Stops a server, removes its tools and forgets it for the project (`forget: false` keeps it remembered). |
+| `sitter_list` | Attached servers, their commands, which exposed name maps to which tool, what is remembered, and how each remembered server's attach at start went. |
 
 Why a hub: Claude Code does not load a server added while it runs (not even
 from `/mcp`), but it does re-read the tool list of a server it already has
 when that server sends `tools/list_changed`. The hub is that server.
 
-- **Tool names** are `<name>_<tool>`, so Claude Code shows
-  `mcp__sitter-dev__<name>_<tool>`. Tool names are capped at 64 characters,
+- **Shadow copy by default.** An attached server runs from a copy of its
+  directory, so its build output is never locked: a plain `dotnet build` (or
+  any build that overwrites files in place) just works, and the next call runs
+  the new build. Turn it off with `shadow_copy: false` for a server that finds
+  files relative to its own location outside its directory.
+- **Remembered per project.** Attachments are stored (arguments and env) in
+  the per-user data folder, keyed by the directory the client runs in, and
+  attached again automatically when the next session starts; the hub's
+  instructions name them. `remember: false` or `sitter_detach` opts out.
+- **Tool names** are `<name>_<tool>` (a tool already named `<name>_…` keeps
+  its name), so Claude Code shows `mcp__sitter-dev__<name>_<tool>`. Tool names are capped at 64 characters,
   so a longer one is cut and ends in a short hash of its full name; it stays
   the same across reloads, and `sitter_list` shows the mapping. Each server
   also gets `<name>_sitter_status`, `<name>_sitter_kill`,
@@ -417,9 +436,7 @@ when that server sends `tools/list_changed`. The hub is that server.
 - **Requests from a server to the client** (sampling, roots, elicitation)
   pass through with ids that stay unique across servers.
 - **Limits.** Only tools are merged: a server's prompts and resources are
-  not exposed through the hub. Attachments last until the client exits; the
-  AI attaches again in a new session, or you make one permanent with
-  `mcp-sitter add`.
+  not exposed through the hub.
 
 ### During downtime
 

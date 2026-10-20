@@ -376,6 +376,8 @@ Describe "hub" {
             @((Recv-Until-Id $p $id).result.tools | ForEach-Object name)
         }
 
+        # The hub remembers attachments per project; keep this run's memory private.
+        $env:MCP_SITTER_HUB_STATE = Join-Path $TestDrive 'hub-state'
         $script:exe = New-FakeMcpCopy 'hub'
         $script:h = Start-Hub
         Invoke-Handshake $script:h
@@ -383,6 +385,7 @@ Describe "hub" {
     }
     AfterAll {
         Stop-Sitter $script:h
+        Remove-Item Env:MCP_SITTER_HUB_STATE -ErrorAction SilentlyContinue
     }
 
     It "starts with only its own tools" {
@@ -401,22 +404,22 @@ Describe "hub" {
         ($lines | Where-Object method -eq 'notifications/tools/list_changed') | Should -Not -BeNullOrEmpty
         $text = $lines[-1].result.content[0].text
         $lines[-1].result.isError | Should -Not -BeTrue
-        $text | Should -Match 'fake_fake_echo\s+->\s+fake_echo'
+        $text | Should -Match 'fake_echo\s+->\s+fake_echo'
         $text | Should -Match 'Always say please\.'
         $names = Get-ToolNames $script:h ($script:nextId++)
-        $names | Should -Contain 'fake_fake_echo'
+        $names | Should -Contain 'fake_echo'
         $names | Should -Contain 'fake_sitter_status'
     }
 
     It "routes a prefixed call to the server under its own name" {
-        $r = Call-Tool $script:h ($script:nextId++) 'fake_fake_echo' @{ text = 'via hub' }
+        $r = Call-Tool $script:h ($script:nextId++) 'fake_echo' @{ text = 'via hub' }
         $r.result.content[-1].text | Should -Be 'echo: via hub'
     }
 
     It "passes a crash through as an error, not a hang" {
-        $r = Call-Tool $script:h ($script:nextId++) 'fake_fake_crash' @{ text = 'x' } 10
+        $r = Call-Tool $script:h ($script:nextId++) 'fake_crash' @{ text = 'x' } 10
         $r.error.message | Should -Match 'exited \(code 3\)'
-        $r = Call-Tool $script:h ($script:nextId++) 'fake_fake_echo' @{ text = 'back' } 15
+        $r = Call-Tool $script:h ($script:nextId++) 'fake_echo' @{ text = 'back' } 15
         $r.result.content[-1].text | Should -Be 'echo: back'
     }
 
@@ -424,15 +427,15 @@ Describe "hub" {
         Set-Content -LiteralPath (Join-Path (Split-Path $script:exe) 'toolset.txt') -Value 'b'
         Publish-NewBuild $script:exe
         $id = $script:nextId++
-        Send-Msg $script:h @{ jsonrpc='2.0'; id=$id; method='tools/call'; params=@{ name='fake_fake_echo'; arguments=@{ text='new build' } } }
+        Send-Msg $script:h @{ jsonrpc='2.0'; id=$id; method='tools/call'; params=@{ name='fake_echo'; arguments=@{ text='new build' } } }
         $lines = Recv-Lines-Until-Id $script:h $id
         $texts = @($lines[-1].result.content | ForEach-Object text)
         $texts | Should -Contain 'echo: new build'
         ($texts -join "`n") | Should -Match 'server restarted \(binary changed'
         Start-Sleep -Milliseconds 500
         $names = Get-ToolNames $script:h ($script:nextId++)
-        $names | Should -Contain 'fake_fake_reverse'
-        $names | Should -Not -Contain 'fake_fake_log'
+        $names | Should -Contain 'fake_reverse'
+        $names | Should -Not -Contain 'fake_log'
     }
 
     It "keeps two servers with the same tool names apart" {
@@ -440,7 +443,7 @@ Describe "hub" {
         $r = Call-Tool $script:h ($script:nextId++) 'sitter_attach' @{ name = 'other'; command = $other } 20
         $r.result.isError | Should -Not -BeTrue
         (Call-Tool $script:h ($script:nextId++) 'other_fake_upper' @{ text = 'abc' }).result.content[-1].text | Should -Be 'ABC'
-        (Call-Tool $script:h ($script:nextId++) 'fake_fake_echo' @{ text = 'still' }).result.content[-1].text | Should -Be 'echo: still'
+        (Call-Tool $script:h ($script:nextId++) 'fake_echo' @{ text = 'still' }).result.content[-1].text | Should -Be 'echo: still'
     }
 
     It "shortens a tool name past the length limit and keeps it routable" {
@@ -473,6 +476,59 @@ Describe "hub" {
         $r = Call-Tool $script:h ($script:nextId++) 'sitter_attach' @{ name = 'broken'; command = (Join-Path $TestDrive 'nope.exe') } 20
         $r.result.isError | Should -BeTrue
         $r.result.content[0].text | Should -Match 'command not found'
+    }
+
+    It "runs from a shadow copy, so a build can overwrite the exe in place while it runs" {
+        $text = (Call-Tool $script:h ($script:nextId++) 'sitter_list' @{}).result.content[0].text
+        $status = (Call-Tool $script:h ($script:nextId++) 'fake_sitter_status' @{}).result.content[-1].text | ConvertFrom-Json
+        $status.shadowCopy | Should -Not -BeNullOrEmpty
+        $status.shadowCopy | Should -Not -Be ([IO.Path]::GetFullPath($script:exe))
+        # in place, no rename: this is what a plain `dotnet build` does, and
+        # it fails on Windows when the exe itself is running
+        $tmp = "$script:exe.tmp"
+        Copy-Item -LiteralPath $script:exe -Destination $tmp
+        { Copy-Item -LiteralPath $tmp -Destination $script:exe -Force } | Should -Not -Throw
+        (Get-Item -LiteralPath $script:exe).LastWriteTimeUtc = [datetime]::UtcNow
+        Remove-Item -LiteralPath $tmp
+        $r = Call-Tool $script:h ($script:nextId++) 'fake_echo' @{ text = 'in place' } 20
+        $texts = @($r.result.content | ForEach-Object text)
+        $texts | Should -Contain 'echo: in place'
+        ($texts -join "`n") | Should -Match 'binary changed'
+    }
+
+    It "tells the AI how to load the new tools" {
+        $other = New-FakeMcpCopy 'hub3'
+        $r = Call-Tool $script:h ($script:nextId++) 'sitter_attach' @{ name = 'tmp'; command = $other; remember = $false } 20
+        $r.result.content[0].text | Should -Match 'select:mcp__sitter-dev__tmp_fake_echo,'
+        $r.result.content[0].text | Should -Match 'Not remembered'
+        $null = Call-Tool $script:h ($script:nextId++) 'sitter_detach' @{ name = 'tmp' }
+    }
+
+    It "attaches the remembered servers again in the next session of this project" {
+        $h2 = Start-Hub
+        try {
+            Send-Msg $h2 @{ jsonrpc='2.0'; id=1; method='initialize'; params=@{ protocolVersion='2024-11-05'; clientInfo=@{ name='pester'; version='0' }; capabilities=@{} } }
+            $init = Recv-Until-Id $h2 1
+            $init.result.instructions | Should -Match 'Remembered for this project.*fake'
+            $init.result.instructions | Should -Not -Match '\bother\b'
+            Send-Msg $h2 @{ jsonrpc='2.0'; method='notifications/initialized' }
+            $deadline = (Get-Date).AddSeconds(20); $names = @()
+            while ((Get-Date) -lt $deadline -and $names -notcontains 'fake_echo') {
+                Start-Sleep -Milliseconds 300
+                $names = Get-ToolNames $h2 (Get-Random -Minimum 5000 -Maximum 9000)
+            }
+            $names | Should -Contain 'fake_echo'
+            (Call-Tool $h2 9100 'fake_echo' @{ text = 'remembered' }).result.content[-1].text | Should -Be 'echo: remembered'
+            # detach forgets it: a third session starts empty
+            $null = Call-Tool $h2 9101 'sitter_detach' @{ name = 'fake' }
+        }
+        finally { Stop-Sitter $h2 }
+        $h3 = Start-Hub
+        try {
+            Send-Msg $h3 @{ jsonrpc='2.0'; id=1; method='initialize'; params=@{ protocolVersion='2024-11-05'; clientInfo=@{ name='pester'; version='0' }; capabilities=@{} } }
+            (Recv-Until-Id $h3 1).result.instructions | Should -Not -Match 'Remembered for this project'
+        }
+        finally { Stop-Sitter $h3 }
     }
 }
 

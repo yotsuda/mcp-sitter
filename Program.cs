@@ -79,6 +79,8 @@ Options:
                            <name>.dll beside it. Use it for a script server
                            (node, python), e.g. --reload-on dist
   --no-reload-on-change    Restart only on sitter_kill or a crash
+  --shadow-copy            Run the child from a copy of its directory, so
+                           the build output is never locked
   --help, -h               Show this help
 
 mcp-sitter speaks MCP over stdio to its parent (e.g. Claude Code) and

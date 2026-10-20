@@ -67,6 +67,17 @@ public sealed class Sitter
     string? _spawnStamp;
     string? _restartReason;
 
+    // Shadow copy (--shadow-copy): the child runs from a copy of its
+    // directory, so the build output is never locked and any build can
+    // write it in place. One numbered generation per spawn.
+    string? _shadowRoot;
+    string? _shadowExe;
+    int _shadowGen;
+
+    // Short notes for the AI, prepended to the next tool/call response.
+    readonly List<string> _pendingNotices = new();
+    readonly object _noticeLock = new();
+
     // restart notice tracking
     DateTime? _spawnStartedUtc;
     TimeSpan? _lastStartupDuration;
@@ -93,6 +104,7 @@ public sealed class Sitter
         await Task.WhenAny(reader, writer);
         _shutdownCts.Cancel();
         try { await KillChildAsync(); } catch { }
+        if (_shadowRoot != null) { try { Directory.Delete(_shadowRoot, recursive: true); } catch { } }
         try { _toClient.Writer.TryComplete(); } catch { }
         try { await Task.WhenAll(reader, writer); } catch { }
         Log.Info("shutdown complete");
@@ -413,6 +425,7 @@ public sealed class Sitter
                 : null,
             ["lastToolsDiff"] = _lastToolsDiffSummary,
             ["inFlightRequests"] = InFlightCount(),
+            ["shadowCopy"] = _shadowExe,
             ["reloadOnChange"] = _watchPaths is { Count: > 0 } paths
                 ? new JsonArray(paths.Select(p => (JsonNode?)JsonValue.Create(p)).ToArray())
                 : null,
@@ -594,7 +607,7 @@ public sealed class Sitter
     {
         var psi = new ProcessStartInfo
         {
-            FileName = _config.ChildCommand,
+            FileName = (_config.ShadowCopy ? PrepareShadowCopy() : null) ?? _config.ChildCommand,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -749,6 +762,12 @@ public sealed class Sitter
         var exe = ResolveChildExePath();
         if (exe == null) return list;
         list.Add(exe);
+        // A shadow copy takes the whole directory, so any file in it counts.
+        if (_config.ShadowCopy && Path.GetDirectoryName(exe) is string dir)
+        {
+            list.Add(dir);
+            return list;
+        }
         var dll = Path.ChangeExtension(exe, ".dll");
         if (!string.Equals(dll, exe, StringComparison.OrdinalIgnoreCase) && File.Exists(dll)) list.Add(dll);
         return list;
@@ -800,7 +819,20 @@ public sealed class Sitter
     {
         foreach (var p in paths)
         {
-            if (Directory.Exists(p)) continue;
+            if (Directory.Exists(p))
+            {
+                // A build writes a directory over a second or more: wait for a
+                // quiet second, so a pause between two files is not taken
+                // for the end.
+                try
+                {
+                    var newest = new DirectoryInfo(p).EnumerateFiles("*", SearchOption.AllDirectories)
+                        .Select(f => f.LastWriteTimeUtc).DefaultIfEmpty(DateTime.MinValue).Max();
+                    if (DateTime.UtcNow - newest < TimeSpan.FromSeconds(1)) return false;
+                }
+                catch { return false; }
+                continue;
+            }
             if (!File.Exists(p)) return false;
             try { using var _ = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.Read); }
             catch { return false; }
@@ -823,6 +855,8 @@ public sealed class Sitter
         if (InFlightCount() > 0)
         {
             Log.Info("binary changed; reload deferred while requests are in flight");
+            AddNotice("[mcp-sitter] a new build is on disk, but other calls are still running on the current one; " +
+                      "this call ran on the previous build, and a later call picks the new one up.");
             return;
         }
 
@@ -842,6 +876,8 @@ public sealed class Sitter
         if (!settled)
         {
             Log.Info("binary changed but is still being written; keeping the running child for now");
+            AddNotice("[mcp-sitter] a new build is still being written (or locked); this call ran on the previous build. " +
+                      "Call again once the build has finished.");
             return;
         }
 
@@ -852,6 +888,91 @@ public sealed class Sitter
         _lastKillUtc = DateTime.UtcNow;
         _lastKillReason = "binary changed";
         await EnsureChildReadyAsync(ct);
+    }
+
+    void AddNotice(string text)
+    {
+        lock (_noticeLock)
+            if (!_pendingNotices.Contains(text)) _pendingNotices.Add(text);
+    }
+
+    // =================================================================
+    // shadow copy
+    // =================================================================
+
+    static string ShadowBase()
+    {
+        string root;
+        try { root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData); }
+        catch { root = ""; }
+        if (string.IsNullOrEmpty(root)) root = Path.GetTempPath();
+        return Path.Combine(root, "mcp-sitter", "shadow");
+    }
+
+    const long ShadowCopyLimit = 512L * 1024 * 1024;
+
+    // Copies the child's directory to a fresh generation and returns the exe
+    // inside it, or null to run in place (an interpreter, an unresolvable
+    // exe, a directory too large to copy, or a copy that failed).
+    string? PrepareShadowCopy()
+    {
+        if (IsInterpreter(_config.ChildCommand)) return null;
+        var exe = ResolveChildExePath();
+        if (exe == null || Path.GetDirectoryName(exe) is not string source) return null;
+        try
+        {
+            var files = new DirectoryInfo(source).EnumerateFiles("*", SearchOption.AllDirectories)
+                .Where(f => !f.Name.Contains(".stash-", StringComparison.Ordinal)).ToList();
+            if (files.Sum(f => f.Length) > ShadowCopyLimit)
+            {
+                Log.Warn($"shadow copy skipped: {source} is over {ShadowCopyLimit / (1024 * 1024)} MB; running in place");
+                return null;
+            }
+
+            _shadowRoot ??= Path.Combine(ShadowBase(),
+                $"{Path.GetFileNameWithoutExtension(exe)}-{Environment.ProcessId}");
+            PruneShadows();
+            var gen = Path.Combine(_shadowRoot, (++_shadowGen).ToString());
+            foreach (var f in files)
+            {
+                var target = Path.Combine(gen, Path.GetRelativePath(source, f.FullName));
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                f.CopyTo(target, overwrite: true);
+            }
+            _shadowExe = Path.Combine(gen, Path.GetFileName(exe));
+            Log.Info($"running from shadow copy {gen}");
+            return _shadowExe;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"shadow copy failed, running in place: {ex.Message}");
+            _shadowExe = null;
+            return null;
+        }
+    }
+
+    // Removes this sitter's older generations (a running one stays: its exe
+    // is locked) and the roots of sitters that are gone.
+    void PruneShadows()
+    {
+        try
+        {
+            if (_shadowRoot != null && Directory.Exists(_shadowRoot))
+                foreach (var d in Directory.EnumerateDirectories(_shadowRoot))
+                    try { Directory.Delete(d, recursive: true); } catch { }
+
+            foreach (var root in Directory.EnumerateDirectories(ShadowBase()))
+            {
+                var name = Path.GetFileName(root);
+                var dash = name.LastIndexOf('-');
+                if (dash < 0 || !int.TryParse(name[(dash + 1)..], out var pid)) continue;
+                if (pid == Environment.ProcessId) continue;
+                bool alive;
+                try { using var p = Process.GetProcessById(pid); alive = !p.HasExited; } catch { alive = false; }
+                if (!alive) try { Directory.Delete(root, recursive: true); } catch { }
+            }
+        }
+        catch { }
     }
 
     // =================================================================
@@ -1050,19 +1171,23 @@ public sealed class Sitter
             // Inject restart notice on the first tool/call response after a respawn.
             // Tool/call responses have result.content (a JsonArray); initialize /
             // tools/list / other response shapes do not, so they are skipped.
-            if (_announceRestart
-                && obj["result"] is JsonObject resObj
-                && resObj["content"] is JsonArray contentArr)
+            if (obj["result"] is JsonObject resObj && resObj["content"] is JsonArray contentArr)
             {
-                _announceRestart = false;
-                var notice = BuildRestartNotice();
-                if (notice != null)
+                var notices = new List<string>();
+                if (_announceRestart)
                 {
-                    contentArr.Insert(0, (JsonNode?)new JsonObject
-                    {
-                        ["type"] = "text",
-                        ["text"] = notice,
-                    });
+                    _announceRestart = false;
+                    if (BuildRestartNotice() is string restart) notices.Add(restart);
+                }
+                lock (_noticeLock)
+                {
+                    notices.AddRange(_pendingNotices);
+                    _pendingNotices.Clear();
+                }
+                if (notices.Count > 0)
+                {
+                    for (int n = notices.Count - 1; n >= 0; n--)
+                        contentArr.Insert(0, (JsonNode?)new JsonObject { ["type"] = "text", ["text"] = notices[n] });
                     await SendToClientAsync(obj);
                     return;
                 }
@@ -1091,7 +1216,7 @@ public sealed class Sitter
         parts.Add(header);
 
         var exe = ResolveChildExePath();
-        if (exe != null) parts.Add($"path: {exe}");
+        if (exe != null) parts.Add(_shadowExe != null ? $"path: {exe} (run from a shadow copy; the build output stays unlocked)" : $"path: {exe}");
         if (exe != null && File.Exists(exe))
         {
             try

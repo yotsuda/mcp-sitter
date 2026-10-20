@@ -137,13 +137,21 @@ public sealed class Hub
         {
             case "initialize":
                 _clientInitializeParams = obj["params"]?.DeepClone();
+                var remembered = LoadMemory();
+                var instructions = Instructions;
+                if (remembered.Count > 0)
+                    instructions += "\n\nRemembered for this project and being attached now (tools arrive with " +
+                        "notifications/tools/list_changed): " +
+                        string.Join(", ", remembered.Select(r => $"{r.Key} ({r.Value["command"]})")) +
+                        ". sitter_list shows how each attach went; sitter_detach forgets one.";
                 await RespondAsync(id, new JsonObject
                 {
                     ["protocolVersion"] = obj["params"]?["protocolVersion"]?.DeepClone() ?? "2025-06-18",
                     ["capabilities"] = new JsonObject { ["tools"] = new JsonObject { ["listChanged"] = true } },
                     ["serverInfo"] = new JsonObject { ["name"] = "mcp-sitter-hub", ["version"] = Version() },
-                    ["instructions"] = Instructions,
+                    ["instructions"] = instructions,
                 });
+                if (remembered.Count > 0) _ = Task.Run(() => AttachRememberedAsync(remembered));
                 return;
             case "notifications/initialized":
                 return;
@@ -264,7 +272,7 @@ public sealed class Hub
     // hub tools
     // =================================================================
 
-    async Task<JsonObject> AttachAsync(JsonObject args)
+    async Task<JsonObject> AttachAsync(JsonObject args, bool fromMemory = false)
     {
         var name = args["name"]?.GetValue<string>()?.Trim();
         var command = args["command"]?.GetValue<string>();
@@ -277,11 +285,20 @@ public sealed class Hub
 
         var cwd = args["cwd"]?.GetValue<string>();
         if (cwd != null && !Directory.Exists(cwd)) return ErrorResult($"cwd not found: {cwd}");
-        if ((command.Contains('/') || command.Contains('\\')) && !File.Exists(Path.GetFullPath(command, cwd ?? Environment.CurrentDirectory)))
-            return ErrorResult($"command not found: {command}");
+        if (cwd != null) cwd = Path.GetFullPath(cwd);
+        // A path is made absolute against cwd (or the hub's directory), so it
+        // means the same thing to the child mcp-sitter and in the memory.
+        if (command.Contains('/') || command.Contains('\\'))
+        {
+            command = Path.GetFullPath(command, cwd ?? Environment.CurrentDirectory);
+            if (!File.Exists(command)) return ErrorResult($"command not found: {command}");
+        }
+        var shadowCopy = args["shadow_copy"]?.GetValue<bool>() ?? true;
+        var remember = args["remember"]?.GetValue<bool>() ?? true;
 
         var sitterArgs = new List<string>();
-        if (cwd != null) { sitterArgs.Add("--cwd"); sitterArgs.Add(Path.GetFullPath(cwd)); }
+        if (cwd != null) { sitterArgs.Add("--cwd"); sitterArgs.Add(cwd); }
+        if (shadowCopy) sitterArgs.Add("--shadow-copy");
         if (args["reload_on"] is JsonArray reloadOn)
             foreach (var p in reloadOn)
                 if (p?.GetValue<string>() is string path) { sitterArgs.Add("--reload-on"); sitterArgs.Add(path); }
@@ -320,32 +337,138 @@ public sealed class Hub
         var exposed = Remap().Where(r => ReferenceEquals(r.Child, child)).ToList();
         await NotifyToolsChangedAsync();
 
+        if (!fromMemory)
+        {
+            var stored = (JsonObject)args.DeepClone();
+            stored["name"] = name;
+            stored["command"] = command;
+            if (cwd != null) stored["cwd"] = cwd;
+            stored.Remove("remember");
+            if (remember) Remember(name, stored); else Forget(name);
+        }
+
+        var hubPrefix = $"mcp__{_config.HubName}__";
         var sb = new StringBuilder();
-        sb.Append($"Attached '{name}' (pid {child.Pid}): {exposed.Count} tools, callable now as mcp__{_config.HubName}__<tool>:\n");
+        sb.Append($"Attached '{name}' (pid {child.Pid}): {exposed.Count} tools, callable now as {hubPrefix}<tool>:\n");
         foreach (var r in exposed) sb.Append($"  {r.Exposed}  ->  {r.Tool}\n");
-        sb.Append("Each rebuild is picked up at the next call (see the README's reload rules: on Windows, deploy by renaming the old binary aside, or call ")
-          .Append(name).Append("_sitter_kill before the build).");
+        sb.Append("Claude Code lists them as deferred tools; load them all at once with ToolSearch query \"select:")
+          .Append(string.Join(",", exposed.Select(r => hubPrefix + r.Exposed))).Append("\".\n");
+        sb.Append(shadowCopy
+            ? "It runs from a shadow copy of its directory, so the build output is not locked: just rebuild, and the next call runs the new build."
+            : $"It runs in place: on Windows its binary is locked, so call {name}_sitter_kill before a build that writes it in place.");
+        sb.Append(remember
+            ? " Remembered for this project: the hub attaches it again in the next session (sitter_detach forgets it)."
+            : " Not remembered (remember=false).");
         if (!string.IsNullOrWhiteSpace(instructions))
             sb.Append($"\n\nThe server's own instructions (an MCP client shows these to the model at connect time; read them now):\n{instructions}");
         return TextResult(sb.ToString());
     }
 
+    // =================================================================
+    // per-project memory of attachments
+    // =================================================================
+
+    // Attachments are remembered per directory the client runs in (the
+    // project), in the per-user data folder — never in the project itself.
+    // The stored entries are sitter_attach arguments, env included.
+    static string MemoryPath()
+    {
+        var cwd = Path.GetFullPath(Environment.CurrentDirectory).TrimEnd(Path.DirectorySeparatorChar);
+        if (OperatingSystem.IsWindows()) cwd = cwd.ToLowerInvariant();
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cwd)))[..16].ToLowerInvariant();
+        var root = Environment.GetEnvironmentVariable("MCP_SITTER_HUB_STATE");
+        if (string.IsNullOrEmpty(root))
+        {
+            try { root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "mcp-sitter", "hub"); }
+            catch { root = Path.Combine(Path.GetTempPath(), "mcp-sitter", "hub"); }
+        }
+        return Path.Combine(root, hash + ".json");
+    }
+
+    readonly object _memoryLock = new();
+
+    List<KeyValuePair<string, JsonObject>> LoadMemory()
+    {
+        lock (_memoryLock)
+        {
+            try
+            {
+                var path = MemoryPath();
+                if (!File.Exists(path)) return new();
+                if (JsonNode.Parse(File.ReadAllText(path))?["servers"] is not JsonObject servers) return new();
+                return servers.Where(kv => kv.Value is JsonObject)
+                    .Select(kv => new KeyValuePair<string, JsonObject>(kv.Key, (JsonObject)kv.Value!.DeepClone())).ToList();
+            }
+            catch (Exception ex) { Log.Warn($"hub memory unreadable: {ex.Message}"); return new(); }
+        }
+    }
+
+    void UpdateMemory(Action<JsonObject> change)
+    {
+        lock (_memoryLock)
+        {
+            try
+            {
+                var path = MemoryPath();
+                var root = File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path)) as JsonObject : null;
+                root ??= new JsonObject();
+                root["cwd"] = Environment.CurrentDirectory;
+                if (root["servers"] is not JsonObject servers) root["servers"] = servers = new JsonObject();
+                change(servers);
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllText(path, root.ToJsonString(new() { WriteIndented = true }));
+            }
+            catch (Exception ex) { Log.Warn($"hub memory not saved: {ex.Message}"); }
+        }
+    }
+
+    void Remember(string name, JsonObject args) => UpdateMemory(s => s[name] = args);
+    void Forget(string name) => UpdateMemory(s => s.Remove(name));
+
+    readonly Dictionary<string, string> _startupResults = new(StringComparer.OrdinalIgnoreCase);
+
+    async Task AttachRememberedAsync(List<KeyValuePair<string, JsonObject>> remembered)
+    {
+        foreach (var (name, args) in remembered)
+        {
+            JsonObject result;
+            try { result = await AttachAsync(args, fromMemory: true); }
+            catch (Exception ex) { result = ErrorResult(ex.Message); }
+            var ok = result["isError"]?.GetValue<bool>() != true;
+            var text = result["content"]?[0]?["text"]?.GetValue<string>() ?? "";
+            lock (_lock) _startupResults[name] = ok ? "attached at start" : "failed at start: " + text;
+            Log.Info($"remembered '{name}': {(ok ? "attached" : text)}");
+        }
+    }
+
     async Task<JsonObject> DetachAsync(JsonObject args)
     {
         var name = args["name"]?.GetValue<string>();
+        var forget = args["forget"]?.GetValue<bool>() ?? true;
         HubChild? child = null;
         if (name != null) lock (_lock) _children.Remove(name, out child);
-        if (child == null) return ErrorResult($"no attached server named '{name}'. Attached: {AttachedNames()}");
+        var wasRemembered = name != null && LoadMemory().Any(r => string.Equals(r.Key, name, StringComparison.OrdinalIgnoreCase));
+        if (forget && wasRemembered) Forget(LoadMemory().First(r => string.Equals(r.Key, name, StringComparison.OrdinalIgnoreCase)).Key);
+        if (child == null)
+            return wasRemembered && forget
+                ? TextResult($"'{name}' was not attached; forgot it for this project.")
+                : ErrorResult($"no attached server named '{name}'. Attached: {AttachedNames()}");
         child.Stop();
         Remap();
         await NotifyToolsChangedAsync();
-        return TextResult($"Detached '{child.Name}'.");
+        return TextResult($"Detached '{child.Name}'." + (forget ? (wasRemembered ? " Forgot it for this project." : "") : " Still remembered for this project."));
     }
 
     JsonObject ListResult()
     {
         List<HubChild> children;
-        lock (_lock) children = _children.Values.ToList();
+        Dictionary<string, string> startup;
+        lock (_lock)
+        {
+            children = _children.Values.ToList();
+            startup = new Dictionary<string, string>(_startupResults, StringComparer.OrdinalIgnoreCase);
+        }
+        var memory = LoadMemory();
         var routes = Remap();
         var arr = new JsonArray();
         foreach (var c in children)
@@ -357,10 +480,23 @@ public sealed class Hub
                 ["name"] = c.Name,
                 ["command"] = c.Command,
                 ["sitterPid"] = c.Pid,
+                ["remembered"] = memory.Any(m => string.Equals(m.Key, c.Name, StringComparison.OrdinalIgnoreCase)),
+                ["startup"] = startup.TryGetValue(c.Name, out var s) ? s : null,
                 ["tools"] = tools,
             });
         }
-        return TextResult(new JsonObject { ["attached"] = arr }.ToJsonString(new() { WriteIndented = true }));
+        // Remembered but not running: it failed at start, or was detached with forget=false.
+        var notRunning = new JsonArray();
+        foreach (var m in memory.Where(m => !children.Any(c => string.Equals(c.Name, m.Key, StringComparison.OrdinalIgnoreCase))))
+            notRunning.Add((JsonNode?)new JsonObject
+            {
+                ["name"] = m.Key,
+                ["command"] = m.Value["command"]?.DeepClone(),
+                ["startup"] = startup.TryGetValue(m.Key, out var s) ? s : null,
+            });
+        var payload = new JsonObject { ["attached"] = arr, ["memoryFile"] = MemoryPath() };
+        if (notRunning.Count > 0) payload["rememberedNotRunning"] = notRunning;
+        return TextResult(payload.ToJsonString(new() { WriteIndented = true }));
     }
 
     string AttachedNames()
@@ -388,7 +524,11 @@ public sealed class Hub
             {
                 foreach (var tool in child.ToolNames())
                 {
-                    var exposed = $"{child.Name}_{tool}";
+                    // A tool already named <name>_... keeps its name rather
+                    // than becoming <name>_<name>_..., unless that clashes.
+                    var exposed = tool.StartsWith(child.Name + "_", StringComparison.OrdinalIgnoreCase) && !_routes.ContainsKey(tool)
+                        ? tool
+                        : $"{child.Name}_{tool}";
                     if (exposed.Length > budget)
                     {
                         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(exposed)))[..6].ToLowerInvariant();
@@ -432,7 +572,9 @@ public sealed class Hub
                     ["args"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Arguments for the command." },
                     ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "Working directory for the server." },
                     ["env"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = new JsonObject { ["type"] = "string" }, ["description"] = "Environment variables for the server." },
-                    ["reload_on"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Files or directories whose change means a new build. Default: the executable (and <name>.dll beside it). Needed for an interpreter, e.g. [\"dist\"]." },
+                    ["reload_on"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Files or directories whose change means a new build. Default: the executable's directory (with shadow_copy) or the executable and <name>.dll beside it. Needed for an interpreter, e.g. [\"dist\"]." },
+                    ["shadow_copy"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Run the server from a copy of its directory, so the build output is never locked and any build can overwrite it. Turn off for a server that finds files relative to its own location outside that directory." },
+                    ["remember"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Attach it again automatically in the next session for this project (stored, env included, in the per-user data folder)." },
                 },
                 ["required"] = new JsonArray("name", "command"),
                 ["additionalProperties"] = false,
@@ -441,11 +583,15 @@ public sealed class Hub
         (JsonNode?)new JsonObject
         {
             ["name"] = Detach,
-            ["description"] = "Stop an attached server and remove its tools.",
+            ["description"] = "Stop an attached server, remove its tools, and forget it for this project.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
-                ["properties"] = new JsonObject { ["name"] = new JsonObject { ["type"] = "string" } },
+                ["properties"] = new JsonObject
+                {
+                    ["name"] = new JsonObject { ["type"] = "string" },
+                    ["forget"] = new JsonObject { ["type"] = "boolean", ["default"] = true, ["description"] = "false keeps it remembered, so the next session attaches it again." },
+                },
                 ["required"] = new JsonArray("name"),
                 ["additionalProperties"] = false,
             },
@@ -466,8 +612,9 @@ public sealed class Hub
         "mcp-sitter hub: attach an MCP server you are developing with sitter_attach(name, command, args). Its tools then " +
         "appear here as <name>_<tool> in this same conversation, without restarting the client, and every rebuild of it " +
         "is picked up at its next call. Each attached server also has <name>_sitter_status, <name>_sitter_kill, " +
-        "<name>_sitter_binary_info and <name>_sitter_child_stderr. Attached servers last until the client exits; " +
-        "for a permanent registration use `mcp-sitter add <name> <exe>` (registers <name>-dev).";
+        "<name>_sitter_binary_info and <name>_sitter_child_stderr. A server runs from a shadow copy by default, so " +
+        "rebuilding it in place just works. Attachments are remembered per project and attached again in the next " +
+        "session; sitter_detach forgets one.";
 
     static JsonObject TextResult(string text) => new()
     {
