@@ -52,6 +52,21 @@ public sealed class Sitter
     readonly HashSet<string> _pendingClientToolsList = new();
     readonly object _toolsListLock = new();
 
+    // Client requests forwarded to the child and not yet answered, by id JSON.
+    // When the child exits or is killed, each gets an error response instead
+    // of leaving the client waiting until its own timeout; a response that
+    // arrives for an id no longer here (already failed, or cancelled by the
+    // client) is dropped, so the client never sees two answers to one request.
+    readonly Dictionary<string, InFlightRequest> _inFlight = new();
+    readonly object _inFlightLock = new();
+
+    // Reload on change: the files whose identity is compared on each tool
+    // call (resolved at first spawn), and their identity when the current
+    // child was spawned.
+    List<string>? _watchPaths;
+    string? _spawnStamp;
+    string? _restartReason;
+
     // restart notice tracking
     DateTime? _spawnStartedUtc;
     TimeSpan? _lastStartupDuration;
@@ -183,7 +198,7 @@ public sealed class Sitter
             _cachedInitializeLine = line;
             _cachedClientInitializeIdJson = obj["id"]!.ToJsonString();
             await EnsureChildStartedAsync(ct);
-            await SendToChildAsync(line);
+            await ForwardToChildAsync(obj, line);
             return;
         }
 
@@ -194,10 +209,21 @@ public sealed class Sitter
             return;
         }
 
+        // A cancelled request is answered by nobody (MCP: the receiver should
+        // not respond), so stop tracking it.
+        if (method == "notifications/cancelled")
+        {
+            if (obj["params"]?["requestId"] is JsonNode cancelledId)
+                lock (_inFlightLock) _inFlight.Remove(cancelledId.ToJsonString());
+            await SendToChildAsync(line);
+            return;
+        }
+
         // tools/list: lazy spawn if child is down, then forward
         if (method == "tools/list" && hasId)
         {
             var idJson = obj["id"]!.ToJsonString();
+            await ReloadIfBinaryChangedAsync(ct);
             if (!_childReady)
             {
                 await EnsureChildReadyAsync(ct);
@@ -208,7 +234,7 @@ public sealed class Sitter
                 }
             }
             lock (_toolsListLock) _pendingClientToolsList.Add(idJson);
-            await SendToChildAsync(line);
+            await ForwardToChildAsync(obj, line);
             return;
         }
 
@@ -221,6 +247,7 @@ public sealed class Sitter
                 await HandleSitterToolCallAsync(obj, name, ct);
                 return;
             }
+            await ReloadIfBinaryChangedAsync(ct);
             if (!_childReady)
             {
                 await EnsureChildReadyAsync(ct);
@@ -231,7 +258,7 @@ public sealed class Sitter
                     return;
                 }
             }
-            await SendToChildAsync(line);
+            await ForwardToChildAsync(obj, line);
             return;
         }
 
@@ -246,7 +273,59 @@ public sealed class Sitter
                 return;
             }
         }
-        await SendToChildAsync(line);
+        await ForwardToChildAsync(obj, line);
+    }
+
+    sealed record InFlightRequest(JsonNode Id, string Method);
+
+    // Forwards a client message. A request (method + id) is tracked until the
+    // child answers it; a message the child cannot receive is answered here.
+    async Task ForwardToChildAsync(JsonObject obj, string line)
+    {
+        var id = obj["id"];
+        var method = obj["method"]?.GetValue<string>();
+        if (id == null || method == null)
+        {
+            // a notification, or the client's answer to a child's request
+            await SendToChildAsync(line);
+            return;
+        }
+
+        var key = id.ToJsonString();
+        // Tracked before sending: the answer can arrive before SendToChildAsync returns.
+        lock (_inFlightLock) _inFlight[key] = new InFlightRequest(id.DeepClone(), method);
+        if (await SendToChildAsync(line)) return;
+
+        bool removed;
+        lock (_inFlightLock) removed = _inFlight.Remove(key);
+        if (removed) await AnswerUndeliveredAsync(new InFlightRequest(id, method),
+            "child MCP server is not running; the request was not delivered. call sitter_status for details");
+    }
+
+    // Answers every request the child will now never answer.
+    async Task FailInFlightAsync(string message)
+    {
+        List<InFlightRequest> requests;
+        lock (_inFlightLock)
+        {
+            requests = _inFlight.Values.ToList();
+            _inFlight.Clear();
+        }
+        foreach (var r in requests)
+            await AnswerUndeliveredAsync(r, message);
+    }
+
+    async Task AnswerUndeliveredAsync(InFlightRequest r, string message)
+    {
+        var key = r.Id.ToJsonString();
+        bool wasToolsList;
+        lock (_toolsListLock) wasToolsList = _pendingClientToolsList.Remove(key);
+        // The tool roster stays stable: a tools/list is served from the cache,
+        // as it is when a lazy spawn fails.
+        if (wasToolsList || r.Method == "tools/list")
+            await RespondToolsListFromCacheAsync(new JsonObject { ["id"] = r.Id.DeepClone() });
+        else
+            await SendClientErrorAsync(r.Id, -32002, message);
     }
 
     async Task RespondToolsListFromCacheAsync(JsonObject request)
@@ -278,7 +357,7 @@ public sealed class Sitter
             JsonObject result = name switch
             {
                 SitterTools.Status => BuildStatusResult(),
-                SitterTools.Kill => await HandleKillCallAsync(ct),
+                SitterTools.Kill => await HandleKillCallAsync(request),
                 SitterTools.BinaryInfo => BuildBinaryInfoResult(),
                 SitterTools.ChildStderr => BuildChildStderrResult(request),
                 _ => new JsonObject
@@ -333,24 +412,42 @@ public sealed class Sitter
                 ? (int)_previousLifetime.Value.TotalSeconds
                 : null,
             ["lastToolsDiff"] = _lastToolsDiffSummary,
+            ["inFlightRequests"] = InFlightCount(),
+            ["reloadOnChange"] = _watchPaths is { Count: > 0 } paths
+                ? new JsonArray(paths.Select(p => (JsonNode?)JsonValue.Create(p)).ToArray())
+                : null,
+            ["binaryChangedSinceSpawn"] = _watchPaths is { Count: > 0 } && _spawnStamp != null
+                ? StampOf(_watchPaths) != _spawnStamp
+                : null,
             ["sitterUptimeSeconds"] = (int)(DateTime.UtcNow - _startedUtc).TotalSeconds,
         };
         var text = payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
         return new JsonObject { ["content"] = new JsonArray(TextContent(text)) };
     }
 
-    async Task<JsonObject> HandleKillCallAsync(CancellationToken ct)
+    async Task<JsonObject> HandleKillCallAsync(JsonObject request)
     {
+        bool others = false;
+        try { others = request["params"]?["arguments"]?["others"]?.GetValue<bool>() ?? false; } catch { }
+
         var killed = new JsonArray();
 
         // 1. Kill own child
         var childPid = _child?.Id;
-        await KillChildAsync();
+        _restartReason = "sitter_kill";
+        await KillChildAsync("killed by sitter_kill before responding");
         if (childPid.HasValue)
             killed.Add((JsonNode?)new JsonObject { ["pid"] = childPid.Value, ["relation"] = "child" });
 
-        // 2. Kill all other processes running the same exe
+        // 2. Other processes running the same exe: they may belong to other
+        // sessions (a client that loses its server may never start it again),
+        // so they are only listed unless the caller asks for them by name —
+        // and never killed when the "exe" is a shared interpreter such as
+        // node or python, which would take unrelated programs (possibly the
+        // MCP client itself) down with them.
         var exePath = ResolveChildExePath();
+        var interpreter = IsInterpreter(_config.ChildCommand);
+        var stillRunning = new JsonArray();
         if (exePath != null)
         {
             foreach (var proc in Process.GetProcesses())
@@ -360,12 +457,18 @@ public sealed class Sitter
                     if (proc.Id == Environment.ProcessId) continue;
                     if (proc.Id == childPid) continue;
                     var modulePath = proc.MainModule?.FileName;
-                    if (modulePath != null &&
-                        string.Equals(Path.GetFullPath(modulePath), exePath, StringComparison.OrdinalIgnoreCase))
+                    if (modulePath == null ||
+                        !string.Equals(Path.GetFullPath(modulePath), exePath, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (others && !interpreter)
                     {
                         proc.Kill(entireProcessTree: true);
                         killed.Add((JsonNode?)new JsonObject { ["pid"] = proc.Id, ["relation"] = "same-path" });
                         Log.Info($"killed same-path process pid {proc.Id}");
+                    }
+                    else
+                    {
+                        stillRunning.Add((JsonNode?)JsonValue.Create(proc.Id));
                     }
                 }
                 catch { }
@@ -382,6 +485,16 @@ public sealed class Sitter
             ["path"] = exePath,
             ["count"] = killed.Count,
         };
+        if (stillRunning.Count > 0)
+        {
+            report["sameExeStillRunning"] = stillRunning;
+            report["note"] = interpreter
+                ? $"{Path.GetFileName(_config.ChildCommand)} is a shared interpreter; other processes running it are never killed."
+                : "These processes also run this executable and can keep it locked on Windows. They may belong to other " +
+                  "sessions, whose clients may not restart a server they lose. A build that renames the old file aside " +
+                  "before copying the new one does not need them stopped; otherwise call sitter_kill with others=true " +
+                  "only if they are yours to stop.";
+        }
         var text = report.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
         return new JsonObject { ["content"] = new JsonArray(TextContent(text)) };
     }
@@ -412,6 +525,20 @@ public sealed class Sitter
         }
         catch { return null; }
     }
+
+    // Runtimes that run a script rather than being the server themselves.
+    static readonly HashSet<string> Interpreters = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "node", "nodejs", "bun", "deno", "npx", "npm", "pnpm", "yarn",
+        "python", "python3", "pythonw", "py", "uv", "uvx",
+        "dotnet", "pwsh", "powershell", "cmd", "bash", "sh", "zsh",
+        "java", "ruby", "php", "perl",
+    };
+
+    static bool IsInterpreter(string command) =>
+        Interpreters.Contains(Path.GetFileNameWithoutExtension(command));
+
+    int InFlightCount() { lock (_inFlightLock) return _inFlight.Count; }
 
     static JsonObject TextContent(string text) => new()
     {
@@ -480,6 +607,9 @@ public sealed class Sitter
         };
         foreach (var a in _config.ChildArgs) psi.ArgumentList.Add(a);
 
+        _watchPaths ??= ResolveWatchPaths();
+        _spawnStamp = _watchPaths.Count > 0 ? StampOf(_watchPaths) : null;
+
         Process child;
         try
         {
@@ -503,14 +633,19 @@ public sealed class Sitter
         var gen = Interlocked.Increment(ref _childGeneration);
         Log.Info($"child spawned; pid {child.Id} gen {gen} (total spawns: {_spawnCount})");
 
-        _ = Task.Run(() => ChildReaderLoop(child, gen));
+        var reader = Task.Run(() => ChildReaderLoop(child, gen));
         _ = Task.Run(() => ChildErrorLoop(child, gen));
-        _ = Task.Run(() => WatchChildExitAsync(child, gen));
+        _ = Task.Run(() => WatchChildExitAsync(child, gen, reader));
     }
 
-    async Task WatchChildExitAsync(Process child, int gen)
+    async Task WatchChildExitAsync(Process child, int gen, Task reader)
     {
         try { await child.WaitForExitAsync(); }
+        catch { }
+        // A child that answered and then exited may still have that answer in
+        // the pipe: read stdout to its end before failing what is in flight.
+        // Bounded, because a grandchild can hold the pipe open.
+        try { await reader.WaitAsync(TimeSpan.FromSeconds(2)); }
         catch { }
         var code = SafeExitCode(child);
         Log.Info($"child (gen {gen}) exited; code {code}");
@@ -539,6 +674,10 @@ public sealed class Sitter
                 foreach (var kv in _pending) kv.Value.TrySetCanceled();
                 _pending.Clear();
             }
+            if (!wasExpected)
+                await FailInFlightAsync(
+                    $"child MCP server exited (code {code}) before responding. It restarts on the next tool call; " +
+                    "call sitter_child_stderr for its output");
         }
     }
 
@@ -548,7 +687,7 @@ public sealed class Sitter
         catch { return "?"; }
     }
 
-    async Task KillChildAsync()
+    async Task KillChildAsync(string inFlightMessage = "child MCP server was stopped before responding")
     {
         await _lifecycleGate.WaitAsync();
         try
@@ -581,6 +720,138 @@ public sealed class Sitter
             foreach (var kv in _pending) kv.Value.TrySetCanceled();
             _pending.Clear();
         }
+        await FailInFlightAsync(inFlightMessage);
+    }
+
+    // =================================================================
+    // reload on change
+    // =================================================================
+
+    // The files whose change means "a new build is here": --reload-on paths
+    // when given; otherwise the child executable, plus <name>.dll beside it
+    // (a framework-dependent .NET app keeps its code there, and an
+    // incremental build can leave the apphost exe untouched). An interpreter
+    // such as node is not the server, so it is never watched by default.
+    List<string> ResolveWatchPaths()
+    {
+        var list = new List<string>();
+        if (!_config.ReloadOnChange) return list;
+        var baseDir = _config.WorkingDirectory ?? Environment.CurrentDirectory;
+        if (_config.ReloadOn.Length > 0)
+        {
+            foreach (var p in _config.ReloadOn)
+            {
+                try { list.Add(Path.GetFullPath(p, baseDir)); } catch { }
+            }
+            return list;
+        }
+        if (IsInterpreter(_config.ChildCommand)) return list;
+        var exe = ResolveChildExePath();
+        if (exe == null) return list;
+        list.Add(exe);
+        var dll = Path.ChangeExtension(exe, ".dll");
+        if (!string.Equals(dll, exe, StringComparison.OrdinalIgnoreCase) && File.Exists(dll)) list.Add(dll);
+        return list;
+    }
+
+    // Identity of the watched files: size and last-write time, which every
+    // new build changes. Not the creation time: Windows hands a file created
+    // under a name just renamed away the old file's creation time ("file
+    // tunneling"), so a rename-and-copy deploy would not change it. A
+    // directory stands for its files (count, total size, newest write).
+    // Null when the files cannot be read: unknown is never a change.
+    static string? StampOf(IEnumerable<string> paths)
+    {
+        try
+        {
+            var sb = new StringBuilder();
+            foreach (var p in paths)
+            {
+                sb.Append(p).Append('|');
+                if (File.Exists(p))
+                {
+                    var fi = new FileInfo(p);
+                    sb.Append(fi.Length).Append('|').Append(fi.LastWriteTimeUtc.Ticks);
+                }
+                else if (Directory.Exists(p))
+                {
+                    long count = 0, total = 0, newest = 0;
+                    foreach (var f in new DirectoryInfo(p).EnumerateFiles("*", SearchOption.AllDirectories))
+                    {
+                        count++;
+                        total += f.Length;
+                        newest = Math.Max(newest, f.LastWriteTimeUtc.Ticks);
+                    }
+                    sb.Append(count).Append('|').Append(total).Append('|').Append(newest);
+                }
+                else sb.Append("missing");
+                sb.Append('\n');
+            }
+            return sb.ToString();
+        }
+        catch { return null; }
+    }
+
+    // True when no watched file is missing or still open for writing. The
+    // open check is what catches a copy in progress on Windows (a copy keeps
+    // the source's write time, so the time alone says nothing); elsewhere
+    // file sharing is advisory, and the caller's two-sample check covers it.
+    static bool AllPresentAndClosed(IEnumerable<string> paths)
+    {
+        foreach (var p in paths)
+        {
+            if (Directory.Exists(p)) continue;
+            if (!File.Exists(p)) return false;
+            try { using var _ = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.Read); }
+            catch { return false; }
+        }
+        return true;
+    }
+
+    // Before a tool call: when a new build has replaced the child's binary,
+    // stop the child (this one only) so the call runs on the new build. The
+    // old child keeps serving until the new files are complete — nothing is
+    // stopped while a build is writing, which is what made the removed
+    // file-watcher fight build tools. A build that cannot replace a running
+    // binary (Windows locks it) still needs sitter_kill first; one that
+    // renames the old file aside before copying the new one does not.
+    async Task ReloadIfBinaryChangedAsync(CancellationToken ct)
+    {
+        if (!_childAlive || _spawnStamp == null || _watchPaths is not { Count: > 0 } paths) return;
+        if (StampOf(paths) is not string first || first == _spawnStamp) return;
+
+        if (InFlightCount() > 0)
+        {
+            Log.Info("binary changed; reload deferred while requests are in flight");
+            return;
+        }
+
+        // Settled: present, closed, and unchanged across two samples.
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        var settled = false;
+        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
+        {
+            var before = StampOf(paths);
+            if (AllPresentAndClosed(paths))
+            {
+                await Task.Delay(300, ct);
+                if (before != null && before == StampOf(paths) && AllPresentAndClosed(paths)) { settled = true; break; }
+            }
+            else await Task.Delay(300, ct);
+        }
+        if (!settled)
+        {
+            Log.Info("binary changed but is still being written; keeping the running child for now");
+            return;
+        }
+
+        Log.Info("binary changed; restarting child on the new build");
+        _restartReason = "binary changed";
+        await KillChildAsync();
+        _killCount++;
+        _lastKillUtc = DateTime.UtcNow;
+        _lastKillReason = "binary changed";
+        await EnsureChildReadyAsync(ct);
     }
 
     // =================================================================
@@ -742,6 +1013,18 @@ public sealed class Sitter
                 return;
             }
 
+            // Every client request is tracked by ForwardToChildAsync; one that
+            // is no longer tracked was already answered with an error (the
+            // child was stopped) or cancelled by the client.
+            bool awaited;
+            lock (_inFlightLock) awaited = _inFlight.Remove(idJson);
+            if (!awaited)
+            {
+                lock (_toolsListLock) _pendingClientToolsList.Remove(idJson);
+                Log.Warn($"dropping child response for id {idJson}: no longer awaited");
+                return;
+            }
+
             if (!_childReady && idJson == _cachedClientInitializeIdJson)
             {
                 _childReady = true;
@@ -797,7 +1080,10 @@ public sealed class Sitter
     {
         var parts = new List<string>();
 
-        var header = $"server restarted (spawn #{_spawnCount}";
+        var header = "server restarted (";
+        if (_restartReason != null) header += $"{_restartReason}, ";
+        _restartReason = null;
+        header += $"spawn #{_spawnCount}";
         if (_child?.Id is int pid) header += $", pid {pid}";
         if (_lastStartupDuration is TimeSpan startup)
             header += $", startup {startup.TotalSeconds:0.0}s";

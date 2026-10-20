@@ -79,6 +79,10 @@ public static class Program
                 Console.Out.WriteLine(response.ToJsonString());
                 Console.Out.Flush();
             }
+
+            // answered, then gone: the answer must still reach the client
+            if (method == "tools/call" && obj["params"]?["name"]?.GetValue<string>() == "fake_exit_after")
+                Environment.Exit(0);
         }
         Console.Error.WriteLine("FakeMcp stdin closed, exiting");
     }
@@ -113,6 +117,8 @@ public static class Program
             Tool("fake_echo", "Echo text", "text"),
             Tool("fake_upper", "Uppercase text", "text"),
             Tool("fake_log", "Write text to stderr and return confirmation", "text"),
+            Tool("fake_crash", "Exit with code 3 without responding", "text"),
+            Tool("fake_exit_after", "Respond, then exit with code 0", "text"),
         };
     }
 
@@ -138,6 +144,11 @@ public static class Program
         var argsNode = request["params"]?["arguments"] as JsonObject;
         var text = argsNode?["text"]?.GetValue<string>() ?? "";
         string result;
+        if (name == "fake_crash")
+        {
+            Console.Error.WriteLine("FakeMcp crashing on purpose");
+            Environment.Exit(3);
+        }
         if (name == "fake_log")
         {
             Console.Error.WriteLine(text);
@@ -150,6 +161,7 @@ public static class Program
                 "fake_echo" => $"echo: {text}",
                 "fake_upper" => text.ToUpperInvariant(),
                 "fake_reverse" => new string(text.Reverse().ToArray()),
+                "fake_exit_after" => $"bye: {text}",
                 _ => $"unknown tool: {name}",
             };
         }

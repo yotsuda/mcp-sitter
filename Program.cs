@@ -49,20 +49,27 @@ Usage:
   mcp-sitter [options] [--] <child-exe> [child-args...]
 
 Options:
-  --cwd <path>         Working directory for the child
-  --help, -h           Show this help
+  --cwd <path>             Working directory for the child
+  --reload-on <path>       File or directory whose change means a new build
+                           (repeatable). Default: the child exe, and
+                           <name>.dll beside it. Use it for a script server
+                           (node, python), e.g. --reload-on dist
+  --no-reload-on-change    Restart only on sitter_kill or a crash
+  --help, -h               Show this help
 
 mcp-sitter speaks MCP over stdio to its parent (e.g. Claude Code) and
-forwards to a child stdio MCP server. When the child is killed (by
-sitter_kill or by crashing), it is lazily respawned on the next tool
-call. If the tool set changed, the parent is notified via
-notifications/tools/list_changed.
+forwards to a child stdio MCP server. When a new build replaces the
+child's binary, the next tool call restarts the child on it. When the
+child is stopped (by sitter_kill or by crashing), it is lazily respawned
+on the next tool call. If the tool set changed, the parent is notified
+via notifications/tools/list_changed.
 
 Built-in tools exposed to the parent:
   sitter_status         Show child status, binary path/version, spawn
                         counts, last startup time, and previous exit info
-  sitter_kill           Kill the child and all processes running the same
-                        exe so the binary can be rebuilt
+  sitter_kill           Stop the child so its binary can be rebuilt
+                        (others=true also stops other processes running
+                        the same exe)
   sitter_binary_info    Show version, build date, and metadata of the
                         child binary — useful for detecting stale builds
   sitter_child_stderr   Tail the child's stderr from a bounded ring

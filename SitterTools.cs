@@ -24,11 +24,19 @@ public static class SitterTools
         (JsonNode?)new JsonObject
         {
             ["name"] = Kill,
-            ["description"] = "Kill the child MCP server AND all other processes running the same executable, so the binary file is unlocked and can be rebuilt. The child will be lazily respawned on the next tool call.",
+            ["description"] = "Stop the child MCP server so its binary is unlocked for a rebuild; the next tool call starts it again. Not needed when the build can replace the running binary (it renames the old file aside first, or the OS allows it): mcp-sitter then restarts the child on the new build by itself at the next tool call. Other processes running the same executable are listed, not stopped, unless others=true.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
-                ["properties"] = new JsonObject(),
+                ["properties"] = new JsonObject
+                {
+                    ["others"] = new JsonObject
+                    {
+                        ["type"] = "boolean",
+                        ["default"] = false,
+                        ["description"] = "Also stop every other process running the same executable. They may belong to other sessions, whose clients may never restart a server they lose; use only for processes that are yours to stop. Never applies to an interpreter such as node or python.",
+                    },
+                },
                 ["additionalProperties"] = false,
             },
         },

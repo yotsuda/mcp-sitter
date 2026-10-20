@@ -1,8 +1,9 @@
 # mcp-sitter
 
-A hot-reload bridge for stdio **Model Context Protocol (MCP)** servers, so you
-can rebuild your MCP server during development **without restarting the MCP
-client** (e.g. Claude Code, Claude Desktop, Cursor, Cline, etc).
+A hot-reload bridge for stdio **Model Context Protocol (MCP)** servers. While
+an AI agent develops your MCP server, it can edit the server, rebuild it, and
+call **the new build in the same conversation** — no client restart, no
+reconnecting by hand (Claude Code, Claude Desktop, Cursor, Cline, etc).
 
 <div align="center">
   <img src="https://github.com/user-attachments/assets/9ae83915-2a07-4d09-a614-cbae4443a792" alt="social-image" width="640" />
@@ -18,10 +19,12 @@ claude mcp add --scope user my-baby-dev `
 ```
 
 That's the entire setup. Your tools are now available as `mcp__my-baby-dev__*`.
-Rebuild your server any time — call `sitter_kill` to unlock the binary, run
-your build, and the next tool call lazily respawns the child. No client
-restart, no lost conversation context, and the AI sees a `[mcp-sitter]`
-notice with the tools-diff so it self-corrects after schema changes.
+Rebuild your server any time — the next tool call runs on the new build. No
+client restart, no lost conversation context, and the AI sees a `[mcp-sitter]`
+notice with the tools-diff so it self-corrects after schema changes. (On
+Windows a running binary is locked: call `sitter_kill` before the build, or
+have the build rename the old file aside before copying the new one — see
+[Reload on change](#reload-on-change).)
 
 > Other MCP clients (Claude Desktop, Cursor, Cline, ...) work the same way:
 > point the client at `mcp-sitter` and pass your server exe + args.
@@ -29,15 +32,18 @@ notice with the tools-diff so it self-corrects after schema changes.
 
 Point your MCP client at `mcp-sitter` instead of your in-development server.
 `mcp-sitter` spawns your server as a child process and proxies all JSON-RPC
-messages. When you need to rebuild, call `sitter_kill` to unlock the binary
-(killing **all** processes running that exe, not just the child). After the
-build, your next `tools/call` **lazily respawns** the child and, if the tool
-set changed, pushes `notifications/tools/list_changed` to the client.
+messages. Before each tool call it checks whether a new build has replaced
+the child's binary; if it has, and the new files are completely written, it
+restarts the child on them. When the child is down — stopped with
+`sitter_kill`, or crashed — the next `tools/call` **lazily respawns** it.
+Either way, if the tool set changed, it pushes
+`notifications/tools/list_changed` to the client.
 
 More importantly, **the first tool/call response after a respawn gets a
 `[mcp-sitter]` notice prepended to its `content` array**, telling the AI:
 
-- how many times the server has been restarted,
+- why the server restarted (binary changed, `sitter_kill`) and how many
+  times it has,
 - how long the startup took,
 - what version/build-date the new binary has,
 - whether the previous instance crashed,
@@ -47,22 +53,29 @@ This makes the AI **self-correcting**: if you renamed a tool or changed a
 schema, the AI sees the diff in the same response as any error, and retries
 with the correct name/shape automatically.
 
-No more "kill the MCP client, rebuild, restart the MCP client, re-open your
-conversation, re-establish context" loop.
+No more "rebuild, then stop and ask a human to restart or reconnect the
+server" loop.
 
 ## Why
 
-Building a stdio MCP server is frustrating:
+Developing a stdio MCP server with an AI agent hits the same wall every time
+the server changes:
 
-1. Your MCP client locks the server binary while the server is running.
-2. To rebuild, you have to kill the running server process, which usually
-   means killing the client (since the client owns it).
-3. After the build succeeds, you have to restart the client to get the new
-   server loaded.
-4. You lose your conversation context every time.
+1. The client starts your server once and keeps talking to that process. A
+   new build on disk changes nothing until the process is replaced.
+2. Replacing it is a step outside the conversation: restart the client, or
+   reconnect the server by hand (`/mcp` → Reconnect in Claude Code). The agent
+   cannot take that step, so it stops and waits for you after every change.
+3. On Windows the running server also locks its binary, so a build that
+   writes it in place fails until that process is gone.
+4. After the restart nothing tells the agent what changed. A renamed tool or
+   a changed schema shows up as confusing errors, and a crash on startup
+   leaves no output the agent can read.
 
 `mcp-sitter` sits between the client and your server and owns the child
-process lifecycle independently of the client.
+process lifecycle independently of the client. The agent runs the whole loop
+on its own — edit, build, call the new build, read the crash output, fix —
+in one conversation.
 
 ## How mcp-sitter is different from other MCP hot-reload tools
 
@@ -93,7 +106,7 @@ graph LR
 
     Client <-->|"stdio JSON-RPC"| Sitter
     Sitter <-->|"stdio JSON-RPC<br/>(spawned &amp; owned)"| Child
-    Sitter -.->|"sitter_kill to<br/>unlock for rebuild"| Bin
+    Sitter -.->|"checks before each tool call;<br/>sitter_kill unlocks it"| Bin
     Bin -.->|"loaded on<br/>next spawn"| Child
 
     style Sitter fill:#4a9,stroke:#272,color:#fff
@@ -113,15 +126,12 @@ sequenceDiagram
 
     Note over C,X: Normal operation
 
-    C->>S: tools/call sitter_kill
-    S->>X: close stdin + SIGKILL (+same-path procs)
-    X--xS: exits
-    S-->>C: kill report
-
-    Note over C,S: You run dotnet build / cargo build / etc.
+    Note over C,S: The AI runs dotnet build / cargo build / etc.<br/>(on Windows, after sitter_kill — or a build that renames the old file aside)
 
     C->>S: tools/call my_tool
-    Note over S: child is down → lazy respawn
+    Note over S: binary changed (or child is down)<br/>→ wait until the new files are complete
+    S->>X: close stdin + kill (this child only)
+    X--xS: exits
     S->>N: spawn
     S->>N: initialize (replayed, internal id)
     N-->>S: initialize response (absorbed)
@@ -141,13 +151,17 @@ sequenceDiagram
 
 ### Typical dev cycle
 
-1. Client sends `tools/call sitter_kill` (or you rebuild directly).
-2. `mcp-sitter` closes stdin on the child, waits 300 ms, then `SIGKILL`s if
-   needed; it also kills every other process on the machine running the
-   same `MainModule.FileName`, so the binary is fully unlocked.
-3. You (or your AI) runs `dotnet build` / `cargo build` / `npm run build` /
+1. The AI (or you) runs `dotnet build` / `cargo build` / `npm run build` /
    whatever produces the new server binary.
-4. Client sends `tools/call my_tool`. The child is down, so `mcp-sitter`:
+   - If the build cannot replace the running binary (Windows, writing the
+     file in place), call `sitter_kill` first. It closes stdin on the child,
+     waits 300 ms, then kills it if needed, which unlocks the file.
+2. The AI calls `tools/call my_tool`. The binary changed or the child is
+   down, so `mcp-sitter`:
+   - waits until the new files are completely written (up to 5 s; if they
+     are not, this call still runs on the old child and the next one checks
+     again),
+   - stops the old child, if it is still running,
    - spawns a new child,
    - replays the cached `initialize` + `notifications/initialized`
      using an internal request id (the response never leaks to the client),
@@ -170,7 +184,7 @@ A typical notice (one text block, pre-pended to the first tool/call response
 after a respawn):
 
 ```
-[mcp-sitter] server restarted (spawn #3, pid 12345, startup 1.8s).
+[mcp-sitter] server restarted (binary changed, spawn #3, pid 12345, startup 1.8s).
 path: C:\dev\my-server\dist\my-server.exe.
 binary v1.2.3+abc123 built 2 min ago. previous: exit 0 after 45s.
 tools: +1 added (search_index), 1 schema changed (read_file).
@@ -204,6 +218,8 @@ sequenceDiagram
     C->>S: tools/call my_tool
     S->>X: forward
     X--xS: exits (unhandled exception)
+    S-->>C: error: child exited (code -1) before responding
+    C-->>AI: the error — no waiting for a client timeout
 
     Note over S: next tool/call triggers lazy respawn
     AI->>C: tools/call my_tool (retry)
@@ -237,6 +253,12 @@ JSON-RPC handshake:
 - `mcp-sitter core` — tools/list merging, tool forwarding, `sitter_kill` +
   lazy respawn with `[mcp-sitter]` restart notice injection, post-respawn
   `sitter_status` deltas.
+- In-flight requests — an error instead of a hang when the child crashes
+  mid-call; an answer written just before exit still arrives.
+- Reload on change — a rename-and-copy deploy restarts the child at the next
+  call with a tools-diff; `--no-reload-on-change` keeps it.
+- `sitter_kill` scope — another process on the same exe is listed, and
+  stopped only with `others: true`.
 - `sitter_child_stderr` — startup stderr capture, mid-lifecycle lines via
   a `fake_log` tool, `since_spawn=true` filter, `since_spawn=false` with a
   `----- child respawn (gen N, pid P) -----` delimiter between generations.
@@ -265,8 +287,8 @@ sub-package at runtime via its `optionalDependencies`.
 
 | Tool                  | What it does |
 | --------------------- | ------------ |
-| `sitter_status`       | Returns child state, binary path/version, child PID, per-spawn and sitter uptimes, spawn/kill counts (including external / crash deaths), last kill reason/time, last startup duration, previous exit info, and last tools-diff summary. |
-| `sitter_kill`         | Kills the child AND every other process running the same executable, so the binary is unlocked for rebuild. The child is lazily respawned on the next tool call. |
+| `sitter_status`       | Returns child state, binary path/version, child PID, per-spawn and sitter uptimes, spawn/kill counts (including external / crash deaths), last kill reason/time, last startup duration, previous exit info, last tools-diff summary, the files watched for a new build and whether they changed since the spawn, and the number of requests in flight. |
+| `sitter_kill`         | Stops the child so its binary is unlocked for a rebuild; the next tool call respawns it. Other processes running the same executable are listed, not stopped — pass `others: true` to stop them too. |
 | `sitter_binary_info`  | Returns version, build date (mtime), size, and metadata of the child binary. Use this to confirm which build is currently loaded and to detect stale binaries. |
 | `sitter_child_stderr` | Tails the child MCP server's stderr from a bounded ring buffer (~1000 lines, persisted across respawns). Crucial for diagnosing child startup failures and crashes — pair with `sitter_status` after a non-zero `previousExitCode`. |
 
@@ -299,6 +321,8 @@ mcp-sitter [options] [--] <child-exe> [child-args...]
 | Option         | Description |
 | -------------- | ----------- |
 | `--cwd <path>` | Working directory for the child process. Defaults to `mcp-sitter`'s cwd. |
+| `--reload-on <path>` | A file or directory whose change means a new build (repeatable). Default: the child executable, plus `<name>.dll` beside it. Use it for a script server, e.g. `--reload-on dist`. |
+| `--no-reload-on-change` | Restart the child only after `sitter_kill` or a crash. |
 | `--help`, `-h` | Show help. |
 
 Use `--` to separate `mcp-sitter` options from the child command if any
@@ -324,15 +348,62 @@ a spawn:
 5. When the child responds to the original request, prepend a
    `[mcp-sitter]` notice to `result.content[0]` and forward.
 
-This eliminates all timing issues with proactive reload — no risk of
-respawning while the build is still writing files.
+Spawning only on demand means nothing is started while a build is still
+writing files.
+
+### Reload on change
+
+Before forwarding a `tools/call` or `tools/list`, `mcp-sitter` compares the
+watched files with what they were when the child was spawned (size and
+last-write time — not creation time, which Windows carries over to a file
+created under a name just renamed away). When they differ:
+
+1. If requests are still in flight to the child, the reload waits for a
+   later call.
+2. It waits for the new files to be complete: all present, none open for
+   writing, unchanged across two samples. Up to 5 s; otherwise this call
+   runs on the old child and the next one checks again.
+3. It stops **its own child only**, then respawns as above. The restart
+   notice says `binary changed`.
+
+Nothing runs in the background and nothing is stopped while a build is
+writing, so the build never races `mcp-sitter` over a half-written file.
+
+On Windows a running binary is locked, so a build that writes it in place
+fails while the child runs. Either call `sitter_kill` before the build, or
+deploy the way `mcp-sitter` handles by itself: rename the old file aside,
+then copy the new one in (Windows allows renaming a running binary; the
+running process keeps the renamed file, and the next spawn loads the new
+one). On Linux and macOS a running binary can be replaced by a new file
+(unlinked or renamed over); a build that rewrites it in place may fail with
+"Text file busy" and then needs `sitter_kill` too.
+
+The default watch is the child executable and `<name>.dll` beside it (a
+framework-dependent .NET app keeps its code in the .dll, and an incremental
+build may leave the exe untouched). When the child command is an
+interpreter (`node`, `python`, `uv`, `dotnet`, …) nothing is watched by
+default — pass `--reload-on` with your build output (`--reload-on dist`;
+a directory stands for every file in it, so point it at the build output,
+not at `node_modules`).
 
 ### `sitter_kill`
 
-Kills all processes running the child executable — not just the one
-`mcp-sitter` spawned. This ensures the binary is fully unlocked for the
-build tool. Process matching is by `MainModule.FileName` comparison
-(case-insensitive, full-path).
+Stops the child `mcp-sitter` spawned, which unlocks its binary. Other
+processes running the same executable (matched by `MainModule.FileName`,
+case-insensitive, full path) are listed in the report but **not** stopped:
+they may be other sessions' servers, and a client that loses its server may
+never start it again. `others: true` stops them too — except when the child
+command is an interpreter such as `node` or `python`, where "the same
+executable" would include unrelated programs, possibly the MCP client
+itself.
+
+### Requests in flight
+
+`mcp-sitter` tracks every client request it forwards to the child until the
+child answers. When the child exits or is stopped first, each such request
+gets an error response right away (a `tools/list` is answered from the
+cache), so the client never waits for its own timeout. An answer the child
+wrote just before exiting is still delivered.
 
 ### During downtime
 
@@ -346,6 +417,12 @@ so the AI's tool roster stays stable.
 - **Stateful children lose state across restart.** Session ids,
   subscriptions, in-memory caches, resource watches, etc. are gone after
   respawn. For pure "tools over data" servers this is a non-issue.
+- **Script servers report the interpreter as "the binary".** For
+  `node server.js` and the like, `sitter_binary_info` and the restart
+  notice's version/age describe `node`, not your code, and a new build is
+  only noticed with `--reload-on`.
+- **A new build is noticed at the next tool call**, not when it lands. A
+  reload is postponed while requests are in flight to the child.
 - **Only `tools/list_changed` is actively surfaced.** Changes to
   `resources/*` or `prompts/*` pass through transparently but the bridge
   does not issue a `notifications/resources/list_changed` after respawn on
