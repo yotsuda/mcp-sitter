@@ -25,6 +25,7 @@ All notable changes to mcp-sitter are documented here. Format based on [Keep a C
 
 ### Changed
 
+- **npm publishing uses Trusted Publishing (OIDC).** The stored npm token had expired (the first v0.3.0 publish failed with E404); the publish job now authenticates as this repository's `release.yml` in the `release` environment, with no token stored anywhere. It runs Node 22 with the latest npm (11.5.1+ is required).
 - **`Build.ps1` no longer stops every running `mcp-sitter.exe`.** That killed the mcp-sitter of every open MCP session on the machine. A running copy of `dist/mcp-sitter.exe` or the npm sub-package binary is now renamed aside and replaced. `Build.ps1 -ReadmeOnly` regenerates `npm/README.md`, which now keeps non-architecture diagrams as links instead of repeating the architecture sketch.
 - **`sitter_kill` stops only its own child by default.** Other processes running the same executable are listed in the report (`sameExeStillRunning`) instead of killed: they may be other sessions' servers, and a client that loses its server may never start it again. `others: true` restores the old behavior — never for an interpreter such as `node` or `python`, where it would kill unrelated programs, possibly the MCP client itself.
 - README: the value is stated as what it is — the agent runs edit → build → call the new build in one conversation — rather than as avoiding a client restart.
